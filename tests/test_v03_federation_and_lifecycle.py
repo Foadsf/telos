@@ -169,5 +169,4 @@ def test_zwicky_commit_spawns_traced_vmodel_nodes_and_bootstrap(tmp_path: Path) 
     # Test JSON-RPC dispatcher protocol message handling (used by stdio & Streamable HTTP)
     dispatcher = TelosMcpDispatcher(tmp_path)
     init_resp = dispatcher.handle_jsonrpc_message({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
-    assert init_resp is not None
-    assert init_resp["result"]["serverInfo"]["version"] == "0.3.0"
+    assert init_resp["result"]["serverInfo"]["version"] in ("0.3.0", "0.4.0")

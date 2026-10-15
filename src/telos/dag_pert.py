@@ -1,4 +1,4 @@
-"""Deterministic DAG Validator, Critical Path Method (CPM), and Monte Carlo Beta-PERT Engine."""
+"""Deterministic DAG Validator, Critical Path Method (CPM), Parallel Wave Planner, and Monte Carlo Engine."""
 
 from __future__ import annotations
 
@@ -37,13 +37,13 @@ class MonteCarloScheduleResult:
     p50_tokens: float
     p80_tokens: float
     p95_tokens: float
-    criticality_index: dict[str, float]  # node_id -> probability [0.0..1.0] of being on critical path
+    criticality_index: dict[str, float]
 
 
 class DagEngine:
     """
     Pure-Python DAG engine for cycle detection, Mikado leaf discovery, V-Model hierarchy rollup,
-    cross-scope federation, CPM, and Monte Carlo simulation.
+    cross-scope federation, parallel multi-agent wave dispatch, CPM, and Monte Carlo simulation.
     """
 
     def __init__(
@@ -56,12 +56,9 @@ class DagEngine:
         self.edges = list(edges)
         self.external_nodes = external_nodes or {}
 
-        # Prerequisite map: prereqs[A] = set of local B where A must wait for B to finish
         self.prereqs: dict[str, set[str]] = {nid: set() for nid in self.nodes}
         self.dependents: dict[str, set[str]] = {nid: set() for nid in self.nodes}
-        # Structural hierarchy map: children_map[Parent] = set of Child IDs
         self.children_map: dict[str, set[str]] = {nid: set() for nid in self.nodes}
-        # Federated external blockers: external_prereqs[A] = list of (scope_ref, target_id)
         self.external_prereqs: dict[str, list[tuple[str, str]]] = {nid: [] for nid in self.nodes}
 
         for edge in self.edges:
@@ -75,7 +72,6 @@ class DagEngine:
             elif edge.relation == EdgeRelation.CONTAINS and not edge.scope_ref:
                 if edge.source_id in self.nodes and edge.target_id in self.nodes:
                     self.children_map[edge.source_id].add(edge.target_id)
-                    # Bottom-up V-Model synthesis: a parent node implicitly depends on its children finishing
                     self.prereqs[edge.source_id].add(edge.target_id)
                     self.dependents[edge.target_id].add(edge.source_id)
 
@@ -152,6 +148,44 @@ class DagEngine:
             )
         )
         return leaves
+
+    def compute_parallel_waves(self) -> list[list[dict[str, object]]]:
+        """
+        Partition unfinished Left-Wing tasks into topological execution waves for concurrent AI agents.
+        Tasks within the same wave have zero mutual dependencies.
+        """
+        topo_order = self.validate_acyclic()
+        cpm_map, _ = self.compute_cpm(include_done=False)
+        active = [
+            nid for nid in topo_order
+            if self.nodes[nid].state != KanbanState.DONE and self.nodes[nid].kind.is_left_wing
+        ]
+        active_set = set(active)
+        wave_index: dict[str, int] = {}
+
+        for nid in active:
+            preds = [p for p in self.prereqs[nid] if p in active_set]
+            wave_index[nid] = (max(wave_index[p] for p in preds) + 1) if preds else 0
+
+        if not wave_index:
+            return []
+
+        max_w = max(wave_index.values())
+        waves: list[list[dict[str, object]]] = [[] for _ in range(max_w + 1)]
+        for nid in active:
+            node = self.nodes[nid]
+            sched = cpm_map.get(nid)
+            waves[wave_index[nid]].append(
+                {
+                    "task_id": nid,
+                    "title": node.title,
+                    "state": node.state.value,
+                    "expected_min": round(node.estimates.duration_minutes.mean, 1),
+                    "float_min": sched.total_float if sched else 0.0,
+                    "critical": sched.is_critical if sched else False,
+                }
+            )
+        return waves
 
     def compute_cpm(self, include_done: bool = False) -> tuple[dict[str, CpmNodeSchedule], float]:
         """Run deterministic Forward and Backward pass to compute ES, EF, LS, LF, and Total Float."""
@@ -310,3 +344,4 @@ class DagEngine:
             p95_tokens=_pct(total_tokens, 0.95),
             criticality_index=crit_index,
         )
+

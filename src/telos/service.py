@@ -27,7 +27,6 @@ from telos.models import (
     VerificationContract,
     VerificationReceipt,
     ZwickyBox,
-    ZwickyCompatibility,
     ZwickyOption,
     ZwickyPairAssessment,
     utc_now,
@@ -42,11 +41,11 @@ class StaleFencingTokenError(PermissionError):
 
 
 class VerificationGateError(PermissionError):
-    """Raised when attempting an illegal state transition or self-approval."""
+    """Raised when attempting an illegal state transition, WIP violation, or self-approval."""
 
 
 class TelosService:
-    """Single authoritative application service for CLI, MCP, and TUI consumers."""
+    """Single authoritative application service for CLI, MCP, TUI, and Web GUI consumers."""
 
     def __init__(self, workspace_root: Path | str = ".") -> None:
         self.root = Path(workspace_root).resolve()
@@ -70,6 +69,8 @@ class TelosService:
         project_name: str,
         super_project_path: str | None = None,
         sub_project_paths: list[str] | None = None,
+        max_wip_per_agent: int = 1,
+        max_wip_total: int = 4,
     ) -> ScopeConfig:
         self.nodes_dir.mkdir(parents=True, exist_ok=True)
         self.edges_file.parent.mkdir(parents=True, exist_ok=True)
@@ -88,12 +89,16 @@ class TelosService:
                 cfg.super_project_path = super_project_path
             if sub_project_paths:
                 cfg.sub_project_paths = sorted(set(cfg.sub_project_paths + sub_project_paths))
+            cfg.max_wip_per_agent = max_wip_per_agent
+            cfg.max_wip_total = max_wip_total
             write_canonical_toml(cfg_path, cfg.model_dump(mode="json"))
         else:
             cfg = ScopeConfig(
                 project_name=project_name,
                 super_project_path=super_project_path,
                 sub_project_paths=sorted(set(sub_project_paths or [])),
+                max_wip_per_agent=max_wip_per_agent,
+                max_wip_total=max_wip_total,
             )
             write_canonical_toml(cfg_path, cfg.model_dump(mode="json"))
 
@@ -448,7 +453,7 @@ class TelosService:
         return left_node, right_node
 
     # -------------------------------------------------------------------------
-    # Lease Management, Heartbeats, Token Circuit Breaker & Quarantine Recovery
+    # Lease Management, WIP Limits, Heartbeats & Quarantine Recovery
     # -------------------------------------------------------------------------
     def expire_stale_leases(self) -> list[str]:
         now = utc_now()
@@ -505,10 +510,6 @@ class TelosService:
         tokens_delta: int = 0,
         extend_ttl_minutes: int = 15,
     ) -> dict[str, Any]:
-        """
-        Update lease heartbeat and token consumption.
-        Automatically trips the circuit breaker (QUARANTINED) if tokens_consumed > token_budget_limit.
-        """
         node = self.get_node(task_id)
         lease = self._validate_fencing_token(node, lease_id, fencing_token)
         new_tokens = lease.tokens_consumed + max(0, tokens_delta)
@@ -573,7 +574,6 @@ class TelosService:
     def unquarantine_task(
         self, task_id: str, rationale: str, reset_strikes: int = 0
     ) -> TaskNode:
-        """Human/Architect recovery action to release a task from QUARANTINED back to READY."""
         node = self.get_node(task_id)
         node.state = KanbanState.READY
         node.strike_count = max(0, reset_strikes)
@@ -583,11 +583,17 @@ class TelosService:
         return self.save_node(node)
 
     def checkout_leaf(
-        self, task_id: str, agent_id: str, ttl_minutes: int = 30, create_worktree: bool = False
+        self,
+        task_id: str,
+        agent_id: str,
+        ttl_minutes: int = 30,
+        create_worktree: bool = False,
+        ignore_wip_limit: bool = False,
     ) -> dict[str, Any]:
         """
         Acquire an exclusive lease with a monotonically incremented fencing_token.
-        Verifies both local prerequisites/children AND federated cross-scope prerequisites are DONE.
+        Enforces Agile Kanban WIP limits (`max_wip_per_agent` and `max_wip_total`),
+        local prerequisites/children, and federated cross-scope prerequisites.
         """
         self.expire_stale_leases()
         node = self.get_node(task_id)
@@ -596,6 +602,29 @@ class TelosService:
                 f"Task {node.id} is QUARANTINED after {node.strike_count} strikes. "
                 f"Decompose via Mikado or run `telos unquarantine` after review."
             )
+
+        cfg = self.get_scope_config()
+        if cfg and not ignore_wip_limit:
+            with self._connect_sqlite() as conn:
+                agent_active = conn.execute(
+                    "SELECT task_id FROM active_leases WHERE active = 1 AND agent_id = ? AND task_id != ?",
+                    (agent_id, node.id),
+                ).fetchall()
+                if len(agent_active) >= cfg.max_wip_per_agent:
+                    held_ids = ", ".join(r["task_id"] for r in agent_active)
+                    raise VerificationGateError(
+                        f"Kanban WIP limit exceeded for agent '{agent_id}' "
+                        f"(max_wip_per_agent={cfg.max_wip_per_agent}; currently leasing: {held_ids}). "
+                        f"Complete, verify, or Mikado-pivot your active task before leasing another."
+                    )
+                total_active = conn.execute(
+                    "SELECT task_id FROM active_leases WHERE active = 1 AND task_id != ?",
+                    (node.id,),
+                ).fetchall()
+                if len(total_active) >= cfg.max_wip_total:
+                    raise VerificationGateError(
+                        f"Workspace Kanban WIP limit exceeded (max_wip_total={cfg.max_wip_total})."
+                    )
 
         dag = self.build_dag_engine()
         unfinished_local = [
@@ -753,15 +782,11 @@ class TelosService:
         return result
 
     # -------------------------------------------------------------------------
-    # Zero-Trust Verification Gate, Bottom-Up V-Model Check & 3-Strike Breaker
+    # Zero-Trust Verification Gate, Worktree Harvest & 3-Strike Breaker
     # -------------------------------------------------------------------------
     def submit_for_verification(
         self, task_id: str, lease_id: str, fencing_token: int
     ) -> dict[str, Any]:
-        """
-        Run all linked V-Model Right-Wing (R*) verification contracts for a leased Left-Wing (L*) task.
-        Also enforces bottom-up V-Model synthesis: all CONTAINS children must be DONE first.
-        """
         node = self.get_node(task_id)
         lease = self._validate_fencing_token(node, lease_id, fencing_token)
 
@@ -792,6 +817,7 @@ class TelosService:
 
         exec_dir = Path(lease.worktree_path)
         all_receipts: list[str] = []
+        last_receipt: VerificationReceipt | None = None
 
         for v_node in verifiers:
             if not v_node.contract:
@@ -805,10 +831,9 @@ class TelosService:
                 contract=v_node.contract,
                 execution_dir=exec_dir,
             )
-            self._append_jsonl(self.receipts_file, receipt)
-            all_receipts.append(receipt.receipt_id)
 
             if not passed:
+                self._append_jsonl(self.receipts_file, receipt)
                 assert fail_cat is not None
                 attempt = AttemptRecord(
                     task_id=node.id,
@@ -853,13 +878,22 @@ class TelosService:
                     "receipt_id": receipt.receipt_id,
                 }
 
+            last_receipt = receipt
+            all_receipts.append(receipt.receipt_id)
             v_node.state = KanbanState.DONE
             v_node.last_verified_receipt_id = receipt.receipt_id
             self.save_node(v_node)
 
-        # Clean up isolated worktree if one was created
-        if exec_dir.resolve() != self.root.resolve():
-            self.git_mgr.remove_isolated_worktree(exec_dir)
+        # Harvest verified changes from isolated worktree back to self.root & record git ref
+        assert last_receipt is not None
+        verified_ref = self.git_mgr.harvest_and_cleanup_worktree(
+            worktree_path=exec_dir,
+            task_id=node.id,
+            receipt_id=last_receipt.receipt_id,
+            baseline_sha=lease.baseline_commit_sha,
+        )
+        last_receipt.verified_git_ref = verified_ref
+        self._append_jsonl(self.receipts_file, last_receipt)
 
         node.state = KanbanState.DONE
         node.active_lease_id = None
@@ -875,11 +909,11 @@ class TelosService:
             "task_id": node.id,
             "state": node.state.value,
             "receipt_ids": all_receipts,
+            "verified_git_ref": verified_ref,
             "newly_ready_tasks": unblocked,
         }
 
     def _auto_ready_dependents(self) -> list[str]:
-        """Transition MIKADO_DISCOVERY or BLOCKED tasks back to READY once all local & external prerequisites reach DONE."""
         dag = self.build_dag_engine()
         newly_ready: list[str] = []
         for nid, node in dag.nodes.items():
@@ -895,10 +929,9 @@ class TelosService:
         return newly_ready
 
     # -------------------------------------------------------------------------
-    # L0 Token-Frugal Radar, Federated Rollup, Scheduling & Zwicky ADR Promotion
+    # L0 Token-Frugal Radar, Parallel Waves, Scheduling & Zwicky ADR Promotion
     # -------------------------------------------------------------------------
     def pulse_radar(self, agent_id: str | None = None) -> dict[str, Any]:
-        """Return compact L0 Radar (~120 tokens) for AI agent orientation, including federated sub-projects."""
         self.expire_stale_leases()
         self._auto_ready_dependents()
         dag = self.build_dag_engine()
@@ -964,6 +997,10 @@ class TelosService:
         mc_result = dag.simulate_monte_carlo(trials=trials, seed=seed, include_done=False)
         return cpm_schedules, mc_result
 
+    def compute_parallel_waves(self) -> list[list[dict[str, object]]]:
+        dag = self.build_dag_engine()
+        return dag.compute_parallel_waves()
+
     def save_zwicky_box(self, box: ZwickyBox) -> ZwickyBox:
         path = self.zwicky_dir / f"{box.id}.toml"
         write_canonical_toml(path, box.model_dump(mode="json"))
@@ -996,7 +1033,10 @@ class TelosService:
         max_cost_budget: float | None = None,
     ) -> ZwickyBox:
         parsed_dims = {
-            dim: [ZwickyOption.model_validate(opt) if isinstance(opt, dict) else ZwickyOption(name=str(opt)) for opt in opts]
+            dim: [
+                ZwickyOption.model_validate(opt) if isinstance(opt, dict) else ZwickyOption(name=str(opt))
+                for opt in opts
+            ]
             for dim, opts in dimensions.items()
         }
         parsed_assessments = [
@@ -1025,10 +1065,6 @@ class TelosService:
         candidate_rank_index: int = 0,
         spawn_tasks: bool = True,
     ) -> dict[str, Any]:
-        """
-        Lock a winning Zwicky Morphological configuration as an Architecture Decision Record (ADR)
-        and optionally spawn traced L1_ARCHITECTURE / L2_MODULE_SPEC tasks linked via DERIVED_FROM.
-        """
         box = self.get_zwicky_box(box_id)
         candidates = self.solve_zwicky_box(box.id, top_k=max(5, candidate_rank_index + 1))
         if not candidates or candidate_rank_index >= len(candidates):
@@ -1071,9 +1107,6 @@ class TelosService:
             "spawned_node_ids": spawned_ids,
         }
 
-    # -------------------------------------------------------------------------
-    # Agent Bootstrap Generator (.mcp.json + AGENTS.md + CLAUDE.md)
-    # -------------------------------------------------------------------------
     def bootstrap_agent_configs(self) -> dict[str, str]:
         """Generate .mcp.json and AGENTS.md / CLAUDE.md instructions for AI assistants."""
         mcp_json_path = self.root / ".mcp.json"
@@ -1092,12 +1125,13 @@ class TelosService:
 You are operating inside a **Telos** deterministic systems-engineering workspace (`.telos/`).
 To prevent context drift, local-optima loops, and reward hacking, follow this strict execution loop:
 
-1. **Orient (`telos_pulse`):** At the start of every session, call `telos_pulse` to inspect active leases, critical path tasks (`float_min=0`), and unblocked Mikado leaf tasks.
-2. **Design Complex Features (`telos_zwicky_create` / `telos_zwicky_commit`):** Before decomposing ambiguous architectural features, evaluate dimensions and incompatibilities in a Zwicky Morphological Box.
-3. **Lease Unblocked Leaves Only (`telos_checkout_leaf`):** Never edit code without an active `lease_id` and `fencing_token`. Read `episodic_memory_do_not_repeat` in the checkout capsule so you never repeat a failed approach.
-4. **Pivot Immediately on Blockers (`telos_mikado_discover`):** If you hit an unmet prerequisite or failing upstream assumption, DO NOT brute-force edits across unrelated files. Call `telos_mikado_discover` to snapshot/reset the worktree, spawn the prerequisite leaf, and solve bottom-up.
-5. **Report Heartbeats (`telos_heartbeat`):** Report token usage during multi-step work.
-6. **Zero-Trust Verification (`telos_submit_verification`):** Never modify locked test files or add `@pytest.mark.skip` / `except: pass`. Close tasks solely via `telos_submit_verification`.
+1. **Orient (`telos_pulse` / `telos_waves`):** At the start of every session, call `telos_pulse` to inspect active leases, critical path tasks (`float_min=0`), and unblocked Mikado leaf tasks.
+2. **Design Complex Features (`telos_zwicky_create` / `telos_zwicky_solve` / `telos_zwicky_commit`):** Before decomposing ambiguous architectural features, evaluate dimensions and incompatibilities in a Zwicky Morphological Box.
+3. **Lock V-Model Contracts (`telos_contract_lock`):** Architect/Verifier agents lock test files and SHA-256 digests before an Implementer agent leases the task.
+4. **Lease Unblocked Leaves Only (`telos_checkout_leaf`):** Never edit code without an active `lease_id` and `fencing_token`. Respect Kanban WIP limits. Read `episodic_memory_do_not_repeat` in the checkout capsule so you never repeat a failed approach.
+5. **Pivot Immediately on Blockers (`telos_mikado_discover`):** If you hit an unmet prerequisite or failing upstream assumption, DO NOT brute-force edits across unrelated files. Call `telos_mikado_discover` to snapshot/reset the worktree, spawn the prerequisite leaf, and solve bottom-up.
+6. **Report Heartbeats (`telos_heartbeat`):** Report token usage during multi-step work.
+7. **Zero-Trust Verification (`telos_submit_verification`):** Never modify locked test files or add `@pytest.mark.skip`, `except: pass`, `except: ...`, or `sys.exit(0)`. Close tasks solely via `telos_submit_verification`.
 """
         agents_md_path = self.root / "AGENTS.md"
         claude_md_path = self.root / "CLAUDE.md"
@@ -1110,3 +1144,4 @@ To prevent context drift, local-optima loops, and reward hacking, follow this st
             "agents_md": str(agents_md_path),
             "claude_md": str(claude_md_path),
         }
+

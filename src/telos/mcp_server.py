@@ -56,6 +56,11 @@ class TelosMcpDispatcher:
                 },
             },
             {
+                "name": "telos_waves",
+                "description": "Return collision-free parallel execution waves for multi-agent dispatch.",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+            {
                 "name": "telos_checkout_leaf",
                 "description": "Lease an unblocked Mikado leaf node with a monotonic fencing_token and retrieve L1 Context Capsule + failure history.",
                 "inputSchema": {
@@ -66,6 +71,23 @@ class TelosMcpDispatcher:
                         "create_worktree": {"type": "boolean", "default": False},
                     },
                     "required": ["task_id", "agent_id"],
+                },
+            },
+            {
+                "name": "telos_contract_lock",
+                "description": "Lock a V-Model Right-Wing verification contract and SHA-256 test digests (role-separated: cannot be called by the active implementer agent).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "left_node_id": {"type": "string"},
+                        "verifier_title": {"type": "string", "default": "Unit Verification"},
+                        "command_argv": {"type": "array", "items": {"type": "string"}},
+                        "locked_paths": {"type": "array", "items": {"type": "string"}},
+                        "ast_scan_paths": {"type": "array", "items": {"type": "string"}},
+                        "min_tests_collected": {"type": "integer", "default": 1},
+                        "active_agent_id": {"type": "string"},
+                    },
+                    "required": ["left_node_id", "command_argv", "locked_paths"],
                 },
             },
             {
@@ -138,6 +160,21 @@ class TelosMcpDispatcher:
                 },
             },
             {
+                "name": "telos_zwicky_create",
+                "description": "Create a Zwicky Morphological Box with dimensions, options, and pairwise Cross-Consistency Assessments.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "problem_statement": {"type": "string"},
+                        "dimensions": {"type": "object"},
+                        "assessments": {"type": "array", "items": {"type": "object"}},
+                        "max_cost_budget": {"type": "number"},
+                    },
+                    "required": ["title", "problem_statement", "dimensions"],
+                },
+            },
+            {
                 "name": "telos_zwicky_solve",
                 "description": "Solve a Zwicky Morphological Box using Cross-Consistency Assessment to rank conflict-free architectures.",
                 "inputSchema": {
@@ -189,6 +226,9 @@ class TelosMcpDispatcher:
             if name == "telos_pulse":
                 res = self.service.pulse_radar(arguments.get("agent_id"))
                 return format_toon(res)
+            if name == "telos_waves":
+                waves = self.service.compute_parallel_waves()
+                return format_toon({"waves": [{"wave": idx, "tasks": w} for idx, w in enumerate(waves)]})
             if name == "telos_checkout_leaf":
                 res = self.service.checkout_leaf(
                     task_id=arguments["task_id"],
@@ -196,6 +236,23 @@ class TelosMcpDispatcher:
                     create_worktree=bool(arguments.get("create_worktree", False)),
                 )
                 return format_toon(res)
+            if name == "telos_contract_lock":
+                l_node, r_node = self.service.approve_verification_contract(
+                    left_node_id=arguments["left_node_id"],
+                    verifier_title=arguments.get("verifier_title", "Unit Verification"),
+                    command_argv=list(arguments["command_argv"]),
+                    locked_paths=list(arguments["locked_paths"]),
+                    ast_scan_paths=list(arguments.get("ast_scan_paths") or arguments["locked_paths"]),
+                    min_tests_collected=int(arguments.get("min_tests_collected", 1)),
+                    active_agent_id=arguments.get("active_agent_id"),
+                )
+                return format_toon(
+                    {
+                        "left_node_id": l_node.id,
+                        "right_verifier_id": r_node.id,
+                        "locked_digests": r_node.contract.locked_digests if r_node.contract else {},
+                    }
+                )
             if name == "telos_heartbeat":
                 res = self.service.report_heartbeat(
                     task_id=arguments["task_id"],
@@ -243,6 +300,15 @@ class TelosMcpDispatcher:
                         ],
                     }
                 )
+            if name == "telos_zwicky_create":
+                box = self.service.create_zwicky_box(
+                    title=arguments["title"],
+                    problem_statement=arguments["problem_statement"],
+                    dimensions=arguments["dimensions"],
+                    assessments=arguments.get("assessments"),
+                    max_cost_budget=arguments.get("max_cost_budget"),
+                )
+                return format_toon({"box_id": box.id, "title": box.title, "dimensions": list(box.dimensions.keys())})
             if name == "telos_zwicky_solve":
                 candidates = self.service.solve_zwicky_box(
                     box_id=arguments["box_id"], top_k=int(arguments.get("top_k", 5))
@@ -291,7 +357,7 @@ class TelosMcpDispatcher:
                 "result": {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "telos-harness", "version": "0.3.0"},
+                    "serverInfo": {"name": "telos-harness", "version": "0.4.0"},
                 },
             }
         if method == "tools/list":
@@ -383,3 +449,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

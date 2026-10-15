@@ -1,4 +1,4 @@
-"""Trusted Anti-Reward-Hacking Verifier: Whole-Tree SHA Lock, AST Anti-Cheat, and HMAC Receipts."""
+"""Trusted Anti-Reward-Hacking Verifier: Whole-Tree SHA Lock, Hardened AST Anti-Cheat, and HMAC Receipts."""
 
 from __future__ import annotations
 
@@ -15,10 +15,11 @@ import time
 from telos.git_worktree import GitPlumbingManager
 from telos.models import FailureCategory, VerificationContract, VerificationReceipt
 
-class _AstCheatVisitor(ast.NodeVisitor):
-    """Detects test skipping decorators, dynamic skip calls, and empty exception swallowing."""
 
-    BANNED_ATTRS = {"skip", "skipIf", "skipUnless", "xfail"}
+class _AstCheatVisitor(ast.NodeVisitor):
+    """Detects test skipping decorators, dynamic skip calls, exit(0) spoofing, and exception swallowing."""
+
+    BANNED_SKIP_NAMES = {"skip", "skipIf", "skipUnless", "xfail", "skipTest"}
 
     def __init__(self, filename: str) -> None:
         self.filename = filename
@@ -26,11 +27,11 @@ class _AstCheatVisitor(ast.NodeVisitor):
 
     def _check_decorator(self, dec: ast.expr) -> None:
         unwrapped = dec.func if isinstance(dec, ast.Call) else dec
-        if isinstance(unwrapped, ast.Attribute) and unwrapped.attr in self.BANNED_ATTRS:
+        if isinstance(unwrapped, ast.Attribute) and unwrapped.attr in self.BANNED_SKIP_NAMES:
             self.violations.append(
                 f"{self.filename}:{dec.lineno}: banned skip/xfail decorator '@...{unwrapped.attr}'"
             )
-        elif isinstance(unwrapped, ast.Name) and unwrapped.id in self.BANNED_ATTRS:
+        elif isinstance(unwrapped, ast.Name) and unwrapped.id in self.BANNED_SKIP_NAMES:
             self.violations.append(
                 f"{self.filename}:{dec.lineno}: banned skip decorator '@{unwrapped.id}'"
             )
@@ -51,18 +52,45 @@ class _AstCheatVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
-        if isinstance(node.func, ast.Attribute) and node.func.attr in {"skip", "xfail", "skipTest"}:
+        if isinstance(node.func, ast.Attribute):
+            if node.func.attr in self.BANNED_SKIP_NAMES:
+                self.violations.append(
+                    f"{self.filename}:{node.lineno}: banned runtime test skip call '{node.func.attr}()'"
+                )
+            elif (
+                isinstance(node.func.value, ast.Name)
+                and node.func.value.id in {"sys", "os"}
+                and node.func.attr in {"exit", "_exit"}
+            ):
+                if not node.args or (
+                    isinstance(node.args[0], ast.Constant) and node.args[0].value == 0
+                ):
+                    self.violations.append(
+                        f"{self.filename}:{node.lineno}: banned exit-code 0 spoofing '{node.func.value.id}.{node.func.attr}(0)'"
+                    )
+        elif isinstance(node.func, ast.Name) and node.func.id in self.BANNED_SKIP_NAMES:
             self.violations.append(
-                f"{self.filename}:{node.lineno}: banned runtime test skip call '{node.func.attr}()'"
+                f"{self.filename}:{node.lineno}: banned direct test skip call '{node.func.id}()'"
             )
         self.generic_visit(node)
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
-        if len(node.body) == 1 and isinstance(node.body[0], ast.Pass):
-            self.violations.append(
-                f"{self.filename}:{node.lineno}: silent 'except: pass' block detected"
-            )
+        if len(node.body) == 1:
+            stmt = node.body[0]
+            if isinstance(stmt, ast.Pass):
+                self.violations.append(
+                    f"{self.filename}:{node.lineno}: silent 'except: pass' block detected"
+                )
+            elif (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Constant)
+                and stmt.value.value is Ellipsis
+            ):
+                self.violations.append(
+                    f"{self.filename}:{node.lineno}: silent 'except: ...' (Ellipsis) block detected"
+                )
         self.generic_visit(node)
+
 
 class TrustedVerifier:
     """Executes verification contracts and signs cryptographic provenance receipts."""
@@ -113,7 +141,6 @@ class TrustedVerifier:
 
     @staticmethod
     def _parse_test_counts(output: str, exit_code: int) -> tuple[int, int, int, int]:
-        """Extract (collected, passed, failed, skipped) from pytest or unittest stdout/stderr."""
         passed = failed = skipped = 0
         m_pass = re.search(r"(\d+)\s+passed", output)
         m_fail = re.search(r"(\d+)\s+(?:failed|error)", output)
@@ -126,7 +153,6 @@ class TrustedVerifier:
             skipped = int(m_skip.group(1))
 
         if passed == 0 and failed == 0 and skipped == 0:
-            # Check unittest style "Ran N tests in ..."
             m_unit = re.search(r"Ran\s+(\d+)\s+tests?", output)
             if m_unit:
                 total = int(m_unit.group(1))
@@ -151,13 +177,6 @@ class TrustedVerifier:
         contract: VerificationContract,
         execution_dir: Path,
     ) -> tuple[bool, FailureCategory | None, str, VerificationReceipt]:
-        """
-        Execute the full verification pipeline:
-        1. Verify SHA-256 digests of all locked test/config paths.
-        2. Run AST static anti-cheat scan on locked_paths + ast_scan_paths.
-        3. Execute command_argv with shell=False in sanitized environment.
-        4. Sign and return VerificationReceipt.
-        """
         start_t = time.monotonic()
         current_digests = self.git_mgr.compute_paths_digests(contract.locked_paths, base_dir=execution_dir)
 
@@ -313,3 +332,4 @@ class TrustedVerifier:
             )
 
         return True, None, "All verification gates and provenance checks passed.", receipt
+

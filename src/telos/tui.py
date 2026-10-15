@@ -11,6 +11,7 @@ from textual.widgets import DataTable, Footer, Header, RichLog, Static, TabbedCo
 from telos.models import EdgeRelation, KanbanState
 from telos.service import TelosService
 
+
 class TelosTuiApp(App[None]):
     """High-contrast reactive TUI displaying Kanban, Mikado DAG, PERT Gantt, V-Model, and Zwicky views."""
 
@@ -34,7 +35,7 @@ class TelosTuiApp(App[None]):
         padding: 1;
     }
     #telemetry-drawer {
-        height: 10;
+        height: 12;
         border-top: solid #30363d;
         background: #161b22;
         padding: 0 1;
@@ -46,17 +47,19 @@ class TelosTuiApp(App[None]):
     """
 
     BINDINGS = [
-        Binding("r", "refresh_state", "Refresh Disk/WAL State"),
+        Binding("r", "refresh_state", "Refresh State"),
+        Binding("u", "unquarantine_selected", "Unquarantine Task"),
         Binding("1", "switch_tab('tab-kanban')", "Kanban"),
-        Binding("2", "switch_tab('tab-pert')", "PERT / Monte Carlo Gantt"),
-        Binding("3", "switch_tab('tab-vmodel')", "V-Model Traceability"),
-        Binding("4", "switch_tab('tab-zwicky')", "Zwicky CCA Matrices"),
+        Binding("2", "switch_tab('tab-pert')", "PERT / Gantt"),
+        Binding("3", "switch_tab('tab-vmodel')", "V-Model"),
+        Binding("4", "switch_tab('tab-zwicky')", "Zwicky CCA"),
         Binding("q", "quit", "Quit"),
     ]
 
     def __init__(self, workspace_root: Path | str = ".") -> None:
         super().__init__()
         self.service = TelosService(workspace_root)
+        self._selected_task_id: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -65,14 +68,14 @@ class TelosTuiApp(App[None]):
             with Vertical(id="center-tabs"):
                 with TabbedContent(id="tabs"):
                     with TabPane("1: Agile Kanban", id="tab-kanban"):
-                        yield DataTable(id="tbl-kanban")
+                        yield DataTable(id="tbl-kanban", cursor_type="row")
                     with TabPane("2: PERT / Monte Carlo Gantt", id="tab-pert"):
                         yield Static(id="pert-summary")
-                        yield DataTable(id="tbl-pert")
+                        yield DataTable(id="tbl-pert", cursor_type="row")
                     with TabPane("3: V-Model Verification Matrix", id="tab-vmodel"):
-                        yield DataTable(id="tbl-vmodel")
+                        yield DataTable(id="tbl-vmodel", cursor_type="row")
                     with TabPane("4: Zwicky Morphological Box", id="tab-zwicky"):
-                        yield DataTable(id="tbl-zwicky")
+                        yield DataTable(id="tbl-zwicky", cursor_type="row")
         yield RichLog(id="telemetry-drawer", highlight=True, markup=True)
         yield Footer()
 
@@ -82,11 +85,39 @@ class TelosTuiApp(App[None]):
     def action_switch_tab(self, tab_id: str) -> None:
         self.query_one("#tabs", TabbedContent).active = tab_id
 
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id == "tbl-kanban" and event.row_key.value:
+            task_id = str(event.row_key.value)
+            self._selected_task_id = task_id
+            node = self.service.get_node(task_id)
+            attempts = self.service.get_attempts_for_task(task_id)
+            receipts = self.service.get_receipts_for_task(task_id)
+            log = self.query_one("#telemetry-drawer", RichLog)
+            log.clear()
+            log.write(
+                f"[bold cyan]Task {node.id}[/bold cyan] ({node.state.value.upper()}) | "
+                f"Title: {node.title} | Spec: {node.concise_spec or 'N/A'}"
+            )
+            for a in attempts[-3:]:
+                log.write(f"  [yellow]Attempt {a.attempt_id[-6:]}[/yellow] [{a.category.value}]: {a.rationale}")
+            for r in receipts[-2:]:
+                log.write(
+                    f"  [green]Receipt {r.receipt_id[-6:]}[/green] exit={r.exit_code} "
+                    f"passed={r.tests_passed} ref={r.verified_git_ref or 'local'}"
+                )
+
+    def action_unquarantine_selected(self) -> None:
+        if not self._selected_task_id:
+            return
+        node = self.service.get_node(self._selected_task_id)
+        if node.state == KanbanState.QUARANTINED:
+            self.service.unquarantine_task(node.id, rationale="Unquarantined via TUI operator action")
+            self.action_refresh_state()
+
     def action_refresh_state(self) -> None:
         nodes = self.service.load_all_nodes()
         edges = self.service.load_all_edges()
 
-        # 1. Populate Left Hierarchy & Mikado Dependency Tree
         tree = self.query_one("#left-tree", Tree)
         tree.clear()
         tree.root.expand()
@@ -101,7 +132,6 @@ class TelosTuiApp(App[None]):
             for p in prereqs:
                 node_branch.add_leaf(f"requires -> {p.title} [{p.state.value}]")
 
-        # 2. Populate Kanban Table
         tbl_k = self.query_one("#tbl-kanban", DataTable)
         tbl_k.clear(columns=True)
         tbl_k.add_columns("ID", "State", "Kind", "Title", "Fencing Gen", "Strikes", "Est (Min)")
@@ -114,9 +144,9 @@ class TelosTuiApp(App[None]):
                 str(n.fencing_token),
                 f"{n.strike_count}/{n.max_strikes}",
                 f"{n.estimates.duration_minutes.mean:.1f}m",
+                key=n.id,
             )
 
-        # 3. Populate PERT / Monte Carlo Gantt Table
         cpm_map, mc = self.service.compute_schedule(trials=1000)
         summary = self.query_one("#pert-summary", Static)
         summary.update(
@@ -146,7 +176,6 @@ class TelosTuiApp(App[None]):
                 f"|{gantt_bar}|",
             )
 
-        # 4. Populate V-Model M:N Verification Matrix
         tbl_v = self.query_one("#tbl-vmodel", DataTable)
         tbl_v.clear(columns=True)
         tbl_v.add_columns("Left-Wing Spec", "Left State", "Right-Wing Verifier", "Locked Paths", "Receipt")
@@ -163,7 +192,6 @@ class TelosTuiApp(App[None]):
                     (l_node.last_verified_receipt_id or "Pending")[-8:],
                 )
 
-        # 5. Populate Zwicky Morphological Table
         tbl_z = self.query_one("#tbl-zwicky", DataTable)
         tbl_z.clear(columns=True)
         tbl_z.add_columns("Box Title", "RankScore", "Synergy", "Unassessed", "Cost", "Configuration")
@@ -180,10 +208,11 @@ class TelosTuiApp(App[None]):
                     cfg_str,
                 )
 
-        # 6. Telemetry Log
         log = self.query_one("#telemetry-drawer", RichLog)
         log.clear()
         log.write(
             f"[bold green]Telos WAL Sync OK[/bold green] | Nodes: {len(nodes)} | Edges: {len(edges)} | "
-            f"Quarantined: {sum(1 for n in nodes.values() if n.state == KanbanState.QUARANTINED)}"
+            f"Quarantined: {sum(1 for n in nodes.values() if n.state == KanbanState.QUARANTINED)} "
+            f"(Select a row in Kanban to inspect attempts/receipts; press 'u' to unquarantine)"
         )
+

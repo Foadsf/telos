@@ -14,6 +14,7 @@ from rich.table import Table
 from telos.mcp_server import format_toon, run_stdio_jsonrpc_server, run_streamable_http_server
 from telos.models import EdgeRelation, KanbanState, NodeKind
 from telos.service import TelosService
+from telos.web_gui import export_dashboard_file, serve_web_gui
 
 console = Console()
 
@@ -43,6 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--name", default="telos-project", help="Project name")
     p_init.add_argument("--super-project", default=None, help="Relative path to parent super-project")
     p_init.add_argument("--sub-project", action="append", default=[], help="Relative path to child sub-project")
+    p_init.add_argument("--max-wip-agent", type=int, default=1, help="Max concurrent leases per AI agent")
+    p_init.add_argument("--max-wip-total", type=int, default=4, help="Max total concurrent leases in scope")
     p_init.add_argument("--bootstrap-agents", action="store_true", help="Also generate .mcp.json and AGENTS.md")
 
     # 2. add
@@ -69,9 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_lock.add_argument("--min-tests", type=int, default=1)
     p_lock.add_argument("cmd", nargs="*", help="Verification command argv (e.g. pytest -q)")
 
-    # 4. pulse
+    # 4. pulse & waves
     p_pulse = sub.add_parser("pulse", help="Display L0 Agent Radar (leases, critical path, ready Mikado leaves)")
     p_pulse.add_argument("--agent", default="cli-agent")
+    sub.add_parser("waves", help="Compute parallel multi-agent execution waves")
 
     # 5. checkout
     p_co = sub.add_parser("checkout", help="Lease an unblocked Mikado leaf node with a monotonic fencing token")
@@ -111,6 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_sched.add_argument("--trials", type=int, default=2000)
 
     # 11. Zwicky commands
+    p_zw_create = sub.add_parser("zwicky-create", help="Create a Zwicky Morphological Box from JSON dimensions")
+    p_zw_create.add_argument("title")
+    p_zw_create.add_argument("--problem", required=True)
+    p_zw_create.add_argument("--dimensions-json", required=True, help='JSON dict e.g. \'{"db":["sqlite","toml"]}\'')
+    p_zw_create.add_argument("--assessments-json", default="[]", help="JSON list of pairwise assessments")
+
     p_zw_solve = sub.add_parser("zwicky-solve", help="Solve a Zwicky Morphological Box")
     p_zw_solve.add_argument("box_id")
     p_zw_solve.add_argument("--top-k", type=int, default=5)
@@ -120,9 +130,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_zw_commit.add_argument("--rationale", required=True)
     p_zw_commit.add_argument("--rank-index", type=int, default=0)
 
-    # 12. bootstrap-agents, tui & mcp
+    # 12. bootstrap-agents, tui, gui, export-html & mcp
     sub.add_parser("bootstrap-agents", help="Generate .mcp.json, AGENTS.md, and CLAUDE.md in workspace")
     sub.add_parser("tui", help="Launch minimalistic interactive Textual TUI")
+
+    p_gui = sub.add_parser("gui", help="Serve minimalist Web GUI dashboard on localhost")
+    p_gui.add_argument("--port", type=int, default=8080)
+    p_gui.add_argument("--open", action="store_true", help="Open in default web browser")
+
+    p_html = sub.add_parser("export-html", help="Export self-contained HTML dashboard file")
+    p_html.add_argument("--out", default="telos-dashboard.html", help="Output HTML file path")
+
     p_mcp = sub.add_parser("mcp", help="Run MCP server (stdio by default, or Streamable HTTP with --http-port)")
     p_mcp.add_argument("--http-port", type=int, default=None, help="Run Streamable HTTP server on this port")
 
@@ -139,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
             args.name,
             super_project_path=args.super_project,
             sub_project_paths=args.sub_project,
+            max_wip_per_agent=args.max_wip_agent,
+            max_wip_total=args.max_wip_total,
         )
         out: dict[str, Any] = cfg.model_dump(mode="json")
         if args.bootstrap_agents:
@@ -193,6 +213,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "pulse":
         _emit(service.pulse_radar(args.agent), args.format)
+        return 0
+
+    if args.command == "waves":
+        waves = service.compute_parallel_waves()
+        _emit({"waves": [{"wave": i, "tasks": w} for i, w in enumerate(waves)]}, args.format)
         return 0
 
     if args.command == "checkout":
@@ -266,6 +291,13 @@ def main(argv: list[str] | None = None) -> int:
             console.print(tbl)
         return 0
 
+    if args.command == "zwicky-create":
+        dims = json.loads(args.dimensions_json)
+        assessments = json.loads(args.assessments_json)
+        box = service.create_zwicky_box(args.title, args.problem, dims, assessments)
+        _emit(box.model_dump(mode="json"), args.format)
+        return 0
+
     if args.command == "zwicky-solve":
         candidates = service.solve_zwicky_box(args.box_id, top_k=args.top_k)
         _emit([c.__dict__ for c in candidates], args.format)
@@ -280,6 +312,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "bootstrap-agents":
         _emit(service.bootstrap_agent_configs(), args.format)
+        return 0
+
+    if args.command == "export-html":
+        out_p = export_dashboard_file(service, Path(args.out))
+        _emit({"exported_html": str(out_p)}, args.format)
+        return 0
+
+    if args.command == "gui":
+        serve_web_gui(args.root, port=args.port, open_browser=args.open)
         return 0
 
     if args.command == "tui":
@@ -301,3 +342,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
