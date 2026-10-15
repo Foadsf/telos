@@ -5,14 +5,23 @@ Supports both JSON-RPC 2.0 `stdio` transport and MCP Streamable HTTP (`POST /mcp
 
 from __future__ import annotations
 
+import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import sys
 from typing import Any
 
+from telos import __version__
 from telos.models import EdgeRelation, KanbanState, NodeKind
 from telos.service import TelosService
+
+# Role separation is a property of the server process, not of an ID the caller supplies.
+# implementer: the default surface; it can never lock contracts or release quarantine.
+# architect:   adds telos_contract_lock (run as a separate server for a separate agent).
+# Unquarantine, attest-done and reseal are human-only: CLI with interactive confirmation, or the TUI.
+ROLES = ("implementer", "architect")
+ARCHITECT_ONLY_TOOLS = {"telos_contract_lock"}
 
 
 def format_toon(data: Any, indent: int = 0) -> str:
@@ -42,10 +51,19 @@ def format_toon(data: Any, indent: int = 0) -> str:
 class TelosMcpDispatcher:
     """Executes cognitive MCP tools against a local `.telos/` workspace."""
 
-    def __init__(self, workspace_root: Path | str = ".") -> None:
+    def __init__(self, workspace_root: Path | str = ".", role: str = "implementer") -> None:
+        if role not in ROLES:
+            raise ValueError(f"Unknown MCP role '{role}'; expected one of {ROLES}")
         self.service = TelosService(workspace_root)
+        self.role = role
 
     def tool_definitions(self) -> list[dict[str, Any]]:
+        return [
+            t for t in self._all_tool_definitions()
+            if self.role == "architect" or t["name"] not in ARCHITECT_ONLY_TOOLS
+        ]
+
+    def _all_tool_definitions(self) -> list[dict[str, Any]]:
         return [
             {
                 "name": "telos_pulse",
@@ -75,7 +93,7 @@ class TelosMcpDispatcher:
             },
             {
                 "name": "telos_contract_lock",
-                "description": "Lock a V-Model Right-Wing verification contract and SHA-256 test digests (role-separated: cannot be called by the active implementer agent).",
+                "description": "Architect role only. Lock a verification contract before any lease; the command must FAIL on the current tree (negative control). Locks test digests and the harness surface.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -85,7 +103,6 @@ class TelosMcpDispatcher:
                         "locked_paths": {"type": "array", "items": {"type": "string"}},
                         "ast_scan_paths": {"type": "array", "items": {"type": "string"}},
                         "min_tests_collected": {"type": "integer", "default": 1},
-                        "active_agent_id": {"type": "string"},
                     },
                     "required": ["left_node_id", "command_argv", "locked_paths"],
                 },
@@ -137,18 +154,6 @@ class TelosMcpDispatcher:
                         "fencing_token": {"type": "integer"},
                     },
                     "required": ["task_id", "lease_id", "fencing_token"],
-                },
-            },
-            {
-                "name": "telos_unquarantine",
-                "description": "Release a QUARANTINED task back to READY after human review or architectural pivot.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "task_id": {"type": "string"},
-                        "rationale": {"type": "string"},
-                    },
-                    "required": ["task_id", "rationale"],
                 },
             },
             {
@@ -222,6 +227,12 @@ class TelosMcpDispatcher:
         ]
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        if name not in {t["name"] for t in self.tool_definitions()}:
+            return (
+                f"TELOS_ERROR (PermissionError): tool '{name}' is not available to the '{self.role}' role. "
+                f"Contract locks need the architect server; quarantine release, DONE attestation and "
+                f"reseal are human-only."
+            )
         try:
             if name == "telos_pulse":
                 res = self.service.pulse_radar(arguments.get("agent_id"))
@@ -244,7 +255,7 @@ class TelosMcpDispatcher:
                     locked_paths=list(arguments["locked_paths"]),
                     ast_scan_paths=list(arguments.get("ast_scan_paths") or arguments["locked_paths"]),
                     min_tests_collected=int(arguments.get("min_tests_collected", 1)),
-                    active_agent_id=arguments.get("active_agent_id"),
+                    approved_by="mcp-architect",
                 )
                 return format_toon(
                     {
@@ -278,12 +289,6 @@ class TelosMcpDispatcher:
                     fencing_token=int(arguments["fencing_token"]),
                 )
                 return format_toon(res)
-            if name == "telos_unquarantine":
-                node = self.service.unquarantine_task(
-                    task_id=arguments["task_id"],
-                    rationale=arguments["rationale"],
-                )
-                return format_toon({"task_id": node.id, "state": node.state.value, "strikes": node.strike_count})
             if name == "telos_schedule_pert":
                 cpm, mc = self.service.compute_schedule(trials=int(arguments.get("trials", 2000)))
                 return format_toon(
@@ -357,7 +362,7 @@ class TelosMcpDispatcher:
                 "result": {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "telos-harness", "version": "0.4.0"},
+                    "serverInfo": {"name": "telos-harness", "version": __version__},
                 },
             }
         if method == "tools/list":
@@ -383,9 +388,9 @@ class TelosMcpDispatcher:
         return None
 
 
-def run_stdio_jsonrpc_server(workspace_root: Path | str = ".") -> None:
+def run_stdio_jsonrpc_server(workspace_root: Path | str = ".", role: str = "implementer") -> None:
     """Built-in MCP JSON-RPC 2.0 stdio transport server."""
-    dispatcher = TelosMcpDispatcher(workspace_root)
+    dispatcher = TelosMcpDispatcher(workspace_root, role=role)
     for raw_line in sys.stdin:
         line = raw_line.strip()
         if not line:
@@ -401,10 +406,10 @@ def run_stdio_jsonrpc_server(workspace_root: Path | str = ".") -> None:
 
 
 def run_streamable_http_server(
-    workspace_root: Path | str = ".", host: str = "127.0.0.1", port: int = 8765
+    workspace_root: Path | str = ".", host: str = "127.0.0.1", port: int = 8765, role: str = "implementer"
 ) -> None:
     """Built-in stateless MCP Streamable HTTP (`POST /mcp`) server."""
-    dispatcher = TelosMcpDispatcher(workspace_root)
+    dispatcher = TelosMcpDispatcher(workspace_root, role=role)
 
     class _McpHttpHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802
@@ -444,7 +449,11 @@ def run_streamable_http_server(
 
 
 def main() -> None:
-    run_stdio_jsonrpc_server(".")
+    parser = argparse.ArgumentParser(prog="telos-mcp", description="Telos MCP stdio server")
+    parser.add_argument("--root", default=".", help="Workspace directory containing .telos/")
+    parser.add_argument("--role", choices=ROLES, default="implementer")
+    args = parser.parse_args()
+    run_stdio_jsonrpc_server(args.root, role=args.role)
 
 
 if __name__ == "__main__":

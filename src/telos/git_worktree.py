@@ -14,6 +14,15 @@ class GitPlumbingManager:
 
     def __init__(self, workspace_root: Path) -> None:
         self.root = workspace_root.resolve()
+        self.worktrees_dir = self.root / ".telos" / ".cache" / "worktrees"
+
+    def is_owned_worktree(self, path: Path) -> bool:
+        """Only worktrees Telos created under .telos/.cache/worktrees may be reset, harvested, or deleted."""
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        return self.worktrees_dir.resolve() in resolved.parents
 
     def _run_git(
         self, args: list[str], cwd: Path | None = None, env: dict[str, str] | None = None
@@ -28,13 +37,22 @@ class GitPlumbingManager:
         )
 
     def has_git_commit(self) -> bool:
+        """Git plumbing is used only when the workspace IS the repository top level.
+
+        A workspace nested inside a larger repository (a monorepo subfolder, a test temp dir) must never
+        stage, snapshot, or reset the enclosing repository; it falls back to digest snapshots.
+        """
+        top = self._run_git(["rev-parse", "--show-toplevel"])
+        if top.returncode != 0 or Path(top.stdout.strip()).resolve() != self.root:
+            return False
         res = self._run_git(["rev-parse", "--verify", "HEAD"])
         return res.returncode == 0
 
     def current_head_sha(self) -> str:
-        res = self._run_git(["rev-parse", "HEAD"])
-        if res.returncode == 0:
-            return res.stdout.strip()
+        if self.has_git_commit():
+            res = self._run_git(["rev-parse", "HEAD"])
+            if res.returncode == 0:
+                return res.stdout.strip()
         return self.compute_directory_digest([self.root], exclude_telos=True)
 
     def create_isolated_worktree(self, lease_id: str) -> tuple[Path, str]:
@@ -52,6 +70,8 @@ class GitPlumbingManager:
         self, worktree_path: Path, baseline_sha: str, ref_name: str, message: str
     ) -> str | None:
         if not (self.has_git_commit() and worktree_path.exists()):
+            return None
+        if worktree_path.resolve() != self.root and not self.is_owned_worktree(worktree_path):
             return None
         tmp_index = self.root / ".telos" / ".cache" / f"tmp_idx_{os.getpid()}_{hash(ref_name) & 0xFFFF}"
         env = os.environ.copy()
@@ -92,7 +112,7 @@ class GitPlumbingManager:
             message=f"Telos Mikado Snapshot task={task_id} attempt={attempt_id}",
         )
         if committed_ref:
-            if worktree_path.resolve() != self.root.resolve():
+            if self.is_owned_worktree(worktree_path):
                 self._run_git(["reset", "--hard", baseline_sha], cwd=worktree_path)
                 self._run_git(["clean", "-fd"], cwd=worktree_path)
             return committed_ref
@@ -120,7 +140,7 @@ class GitPlumbingManager:
             message=f"Telos Verified Receipt task={task_id} receipt={receipt_id}",
         )
 
-        if worktree_path.resolve() != self.root.resolve() and worktree_path.exists():
+        if self.is_owned_worktree(worktree_path) and worktree_path.exists():
             # Sync verified files from isolated worktree into primary workspace root
             wt_files: set[Path] = set()
             for item in worktree_path.rglob("*"):
@@ -151,7 +171,7 @@ class GitPlumbingManager:
         return recorded_ref
 
     def remove_isolated_worktree(self, worktree_path: Path) -> None:
-        if worktree_path.resolve() == self.root.resolve():
+        if not self.is_owned_worktree(worktree_path):
             return
         if worktree_path.exists():
             self._run_git(["worktree", "remove", "--force", str(worktree_path)])

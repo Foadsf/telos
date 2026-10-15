@@ -4,15 +4,20 @@ from __future__ import annotations
 
 from datetime import timedelta
 import json
+import os
 from pathlib import Path
+import shutil
 import sqlite3
+import sys
 from typing import Any
 
 from pydantic import BaseModel
 
 from telos.dag_pert import CpmNodeSchedule, DagEngine, MonteCarloScheduleResult
 from telos.git_worktree import GitPlumbingManager
+from telos.integrity import IntegrityError, SealKeyring
 from telos.models import (
+    AttestationRecord,
     AttemptRecord,
     EdgeRelation,
     FailureCategory,
@@ -44,6 +49,18 @@ class VerificationGateError(PermissionError):
     """Raised when attempting an illegal state transition, WIP violation, or self-approval."""
 
 
+# States a node may be created in; LEASED/VERIFYING/DONE/QUARANTINED are reached only through gates.
+CREATABLE_STATES = (KanbanState.BACKLOG, KanbanState.DESIGNING, KanbanState.READY, KanbanState.BLOCKED)
+# A contract can only be locked before any implementer holds or has finished the task.
+LOCKABLE_STATES = (
+    KanbanState.BACKLOG,
+    KanbanState.DESIGNING,
+    KanbanState.READY,
+    KanbanState.BLOCKED,
+    KanbanState.MIKADO_DISCOVERY,
+)
+
+
 class TelosService:
     """Single authoritative application service for CLI, MCP, TUI, and Web GUI consumers."""
 
@@ -56,10 +73,12 @@ class TelosService:
         self.ledger_dir = self.telos_dir / "ledger"
         self.attempts_file = self.ledger_dir / "attempts.jsonl"
         self.receipts_file = self.ledger_dir / "receipts.jsonl"
+        self.attestations_file = self.ledger_dir / "attestations.jsonl"
         self.cache_dir = self.telos_dir / ".cache"
         self.sqlite_path = self.cache_dir / "index.sqlite"
         self.git_mgr = GitPlumbingManager(self.root)
-        self.verifier = TrustedVerifier(self.root, self.git_mgr)
+        self.keyring = SealKeyring(self.root)
+        self.verifier = TrustedVerifier(self.root, self.git_mgr, self.keyring)
 
     # -------------------------------------------------------------------------
     # Workspace Initialization & SQLite WAL Operational Cache
@@ -72,6 +91,15 @@ class TelosService:
         max_wip_per_agent: int = 1,
         max_wip_total: int = 4,
     ) -> ScopeConfig:
+        if not self.keyring.exists():
+            has_state = self.nodes_dir.exists() and any(self.nodes_dir.glob("*.toml"))
+            if has_state:
+                raise IntegrityError(
+                    f"Workspace {self.root} already holds tasks but this machine has no signing key for it. "
+                    f"A human must review it and run `telos reseal`."
+                )
+            self.keyring.create()
+
         self.nodes_dir.mkdir(parents=True, exist_ok=True)
         self.edges_file.parent.mkdir(parents=True, exist_ok=True)
         self.zwicky_dir.mkdir(parents=True, exist_ok=True)
@@ -84,14 +112,14 @@ class TelosService:
 
         cfg_path = self.telos_dir / "config.toml"
         if cfg_path.exists():
-            cfg = ScopeConfig.model_validate(read_toml(cfg_path))
+            cfg = self.get_scope_config()
+            assert cfg is not None
             if super_project_path is not None:
                 cfg.super_project_path = super_project_path
             if sub_project_paths:
                 cfg.sub_project_paths = sorted(set(cfg.sub_project_paths + sub_project_paths))
             cfg.max_wip_per_agent = max_wip_per_agent
             cfg.max_wip_total = max_wip_total
-            write_canonical_toml(cfg_path, cfg.model_dump(mode="json"))
         else:
             cfg = ScopeConfig(
                 project_name=project_name,
@@ -100,11 +128,11 @@ class TelosService:
                 max_wip_per_agent=max_wip_per_agent,
                 max_wip_total=max_wip_total,
             )
-            write_canonical_toml(cfg_path, cfg.model_dump(mode="json"))
+        self._write_scope_config(cfg)
 
         if not self.edges_file.exists():
-            write_canonical_toml(self.edges_file, {"edges": []})
-        for ledger in (self.attempts_file, self.receipts_file):
+            self._save_edges([])
+        for ledger in (self.attempts_file, self.receipts_file, self.attestations_file):
             if not ledger.exists():
                 ledger.write_text("", encoding="utf-8")
 
@@ -112,11 +140,21 @@ class TelosService:
         self.rebuild_sqlite_index()
         return cfg
 
+    def _write_scope_config(self, cfg: ScopeConfig) -> None:
+        cfg.seal = self.keyring.seal(cfg.security_view())
+        write_canonical_toml(self.telos_dir / "config.toml", cfg.model_dump(mode="json"))
+
     def get_scope_config(self) -> ScopeConfig | None:
         cfg_path = self.telos_dir / "config.toml"
         if not cfg_path.exists():
             return None
-        return ScopeConfig.model_validate(read_toml(cfg_path))
+        cfg = ScopeConfig.model_validate(read_toml(cfg_path))
+        if not self.keyring.check(cfg.security_view(), cfg.seal):
+            raise IntegrityError(
+                f"{cfg_path} fails its seal (WIP limits or scope edited outside Telos). "
+                f"A human must review it and run `telos reseal`."
+            )
+        return cfg
 
     def _connect_sqlite(self) -> sqlite3.Connection:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -162,10 +200,14 @@ class TelosService:
                     acquired_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     last_heartbeat_at TEXT NOT NULL,
-                    active INTEGER NOT NULL
+                    active INTEGER NOT NULL,
+                    seal TEXT NOT NULL DEFAULT ''
                 );
                 """
             )
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(active_leases)")}
+            if "seal" not in cols:
+                conn.execute("ALTER TABLE active_leases ADD COLUMN seal TEXT NOT NULL DEFAULT ''")
 
     def _resolve_external_nodes(self, edges: list[GraphEdge]) -> dict[tuple[str, str], TaskNode | None]:
         """Resolve cross-scope node references across federated sub/super project directories."""
@@ -174,16 +216,13 @@ class TelosService:
             if not edge.scope_ref:
                 continue
             ext_root = (self.root / edge.scope_ref).resolve()
-            ext_nodes_dir = ext_root / ".telos" / "nodes"
             node_obj: TaskNode | None = None
-            if ext_nodes_dir.exists():
-                exact = ext_nodes_dir / f"{edge.target_id}.toml"
-                if exact.exists():
-                    node_obj = TaskNode.model_validate(read_toml(exact))
-                else:
-                    matches = list(ext_nodes_dir.glob(f"{edge.target_id}*.toml"))
-                    if len(matches) == 1:
-                        node_obj = TaskNode.model_validate(read_toml(matches[0]))
+            if (ext_root / ".telos" / "nodes").exists():
+                try:
+                    # The external scope verifies its own seals with its own key; failures stay unresolved.
+                    node_obj = TelosService(ext_root).get_node(edge.target_id)
+                except (KeyError, IntegrityError):
+                    node_obj = None
             external_map[(edge.scope_ref, edge.target_id)] = node_obj
         return external_map
 
@@ -241,10 +280,29 @@ class TelosService:
         return self.nodes_dir / f"{node_id}.toml"
 
     def save_node(self, node: TaskNode) -> TaskNode:
+        """Persist and seal a node. DONE is only persisted with signed evidence (receipt or human attestation)."""
+        if node.state == KanbanState.DONE and not self.has_done_evidence(node):
+            raise VerificationGateError(
+                f"Task {node.id} cannot be DONE without a signed passing VerificationReceipt "
+                f"or a human attestation (`telos attest-done`)."
+            )
         node.updated_at = utc_now()
         node.labels = sorted(set(node.labels))
+        node.seal = self.keyring.seal(node.security_view())
         write_canonical_toml(self._node_path(node.id), node.model_dump(mode="json"))
         self.rebuild_sqlite_index()
+        return node
+
+    def _load_node(self, path: Path) -> TaskNode:
+        """Read a node and fail closed: a node whose seal does not verify is treated as QUARANTINED."""
+        node = TaskNode.model_validate(read_toml(path))
+        if not self.keyring.check(node.security_view(), node.seal):
+            node._integrity_error = (
+                f"seal mismatch on {path.name}: gate fields (state/strikes/lease/contract/receipt) "
+                f"were changed outside Telos (recorded state was '{node.state.value}')"
+            )
+            node.state = KanbanState.QUARANTINED
+            node.active_lease_id = None
         return node
 
     def get_node(self, node_id: str) -> TaskNode:
@@ -255,14 +313,14 @@ class TelosService:
                 path = matches[0]
             else:
                 raise KeyError(f"TaskNode '{node_id}' not found in {self.nodes_dir}")
-        return TaskNode.model_validate(read_toml(path))
+        return self._load_node(path)
 
     def load_all_nodes(self) -> dict[str, TaskNode]:
         if not self.nodes_dir.exists():
             return {}
         result: dict[str, TaskNode] = {}
         for p in sorted(self.nodes_dir.glob("*.toml")):
-            node = TaskNode.model_validate(read_toml(p))
+            node = self._load_node(p)
             result[node.id] = node
         return result
 
@@ -270,14 +328,22 @@ class TelosService:
         if not self.edges_file.exists():
             return []
         raw = read_toml(self.edges_file)
-        edges = [GraphEdge.model_validate(item) for item in raw.get("edges", [])]
+        items = raw.get("edges", [])
+        if not self.keyring.check({"edges": items}, raw.get("seal", "")):
+            raise IntegrityError(
+                f"{self.edges_file} fails its seal (dependencies or verifier links edited outside Telos). "
+                f"A human must review it and run `telos reseal`."
+            )
+        edges = [GraphEdge.model_validate(item) for item in items]
         edges.sort(key=lambda e: e.sort_key())
         return edges
 
     def _save_edges(self, edges: list[GraphEdge]) -> None:
         unique = {e.sort_key(): e for e in edges}
         sorted_edges = [unique[k].model_dump(mode="json") for k in sorted(unique.keys())]
-        write_canonical_toml(self.edges_file, {"edges": sorted_edges})
+        payload: dict[str, Any] = {"edges": sorted_edges}
+        payload["seal"] = self.keyring.seal({"edges": sorted_edges})
+        write_canonical_toml(self.edges_file, payload)
 
     def add_edge(
         self,
@@ -328,6 +394,11 @@ class TelosService:
         parent_id: str | None = None,
         derived_from_zwicky_id: str | None = None,
     ) -> TaskNode:
+        if state not in CREATABLE_STATES:
+            raise VerificationGateError(
+                f"Tasks cannot be created in state '{state.value}'; allowed: "
+                f"{', '.join(s.value for s in CREATABLE_STATES)}. DONE is reached only through a gate."
+            )
         estimates = ResourceEstimates(
             duration_minutes=PertTriplet(
                 optimistic=optimistic_min,
@@ -376,17 +447,59 @@ class TelosService:
                 records.append(rec)
         return records
 
-    def get_receipts_for_task(self, task_id: str) -> list[VerificationReceipt]:
+    def _read_receipts(self) -> list[VerificationReceipt]:
         if not self.receipts_file.exists():
             return []
         records: list[VerificationReceipt] = []
         for line in self.receipts_file.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            rec = VerificationReceipt.model_validate(json.loads(line))
-            if rec.task_id == task_id:
-                records.append(rec)
+            if line.strip():
+                records.append(VerificationReceipt.model_validate(json.loads(line)))
         return records
+
+    def get_receipts_for_task(self, task_id: str) -> list[VerificationReceipt]:
+        return [r for r in self._read_receipts() if r.task_id == task_id]
+
+    def _read_attestations(self) -> list[AttestationRecord]:
+        if not self.attestations_file.exists():
+            return []
+        records: list[AttestationRecord] = []
+        for line in self.attestations_file.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                records.append(AttestationRecord.model_validate(json.loads(line)))
+        return records
+
+    def record_attestation(self, task_id: str, action: str, actor: str, rationale: str) -> AttestationRecord:
+        if not actor or not rationale:
+            raise VerificationGateError("A human attestation needs both an actor and a rationale.")
+        record = AttestationRecord(task_id=task_id, action=action, actor=actor, rationale=rationale[:1000])
+        record.hmac_signature = self.verifier.sign_attestation(record)
+        self._append_jsonl(self.attestations_file, record)
+        return record
+
+    def has_done_evidence(self, node: TaskNode) -> bool:
+        """DONE is backed by a signed passing receipt for this node, or a signed human `done` attestation."""
+        if node.last_verified_receipt_id:
+            for rec in self._read_receipts():
+                if (
+                    rec.receipt_id == node.last_verified_receipt_id
+                    and node.id in (rec.task_id, rec.verifier_node_id)
+                    and rec.is_pass
+                    and self.verifier.verify_receipt_signature(rec)
+                ):
+                    return True
+        return any(
+            att.task_id == node.id
+            and att.action in ("done", "reseal-done")
+            and self.verifier.verify_attestation_signature(att)
+            for att in self._read_attestations()
+        )
+
+    def integrity_violations(self) -> dict[str, str]:
+        return {
+            n.id: n._integrity_error
+            for n in self.load_all_nodes().values()
+            if n._integrity_error
+        }
 
     # -------------------------------------------------------------------------
     # V-Model Role-Separated Contract Approval
@@ -401,15 +514,28 @@ class TelosService:
         min_tests_collected: int = 1,
         approved_by: str = "human-architect",
         active_agent_id: str | None = None,
+        green_baseline_attested_by: str | None = None,
+        green_baseline_rationale: str = "",
     ) -> tuple[TaskNode, TaskNode]:
+        """
+        Lock a Right-Wing contract on a Left-Wing node. Gates (all independent of who claims to call):
+        1. Lock-before-lease: refused once any agent holds, verifies, or finished the task.
+        2. Negative control: the command must FAIL on today's tree (red before green). A command that
+           already passes cannot detect missing work; only a signed human attestation can accept it.
+        3. The harness surface and top-level modules are snapshotted so rigging them later is tamper.
+        """
         left_node = self.get_node(left_node_id)
-        if active_agent_id and left_node.active_lease_id:
-            lease = self.get_lease(left_node.active_lease_id)
-            if lease and lease.agent_id == active_agent_id:
-                raise VerificationGateError(
-                    f"Role separation violation: implementer agent '{active_agent_id}' cannot approve "
-                    f"verification contracts for its own leased task {left_node.id}."
-                )
+        if left_node._integrity_error:
+            raise IntegrityError(f"Cannot lock a contract on tampered node {left_node.id}: {left_node._integrity_error}")
+        if left_node.active_lease_id or left_node.state not in LOCKABLE_STATES:
+            raise VerificationGateError(
+                f"Contracts must be locked before any lease: task {left_node.id} is "
+                f"'{left_node.state.value}'"
+                + (f" with active lease {left_node.active_lease_id}" if left_node.active_lease_id else "")
+                + ". Role separation: the implementer can never write its own exam."
+            )
+        if not left_node.kind.is_left_wing:
+            raise VerificationGateError(f"Contracts verify Left-Wing nodes; {left_node.id} is {left_node.kind.value}.")
 
         right_kind_map = {
             NodeKind.L0_REQUIREMENT: NodeKind.R0_ACCEPTANCE,
@@ -429,10 +555,35 @@ class TelosService:
             command_argv=command_argv,
             locked_paths=sorted(set(locked_paths)),
             locked_digests=locked_digests,
-            min_tests_collected=min_tests_collected,
+            min_tests_collected=max(1, min_tests_collected),
             ast_scan_paths=sorted(set(ast_scan_paths or locked_paths)),
             approved_by=approved_by,
+            harness_digests=self.verifier.harness_surface_digests(self.root, command_argv),
+            module_names_at_lock=self.verifier.top_level_modules(self.root),
         )
+
+        baseline = self.verifier.execute(contract, self.root)
+        contract.baseline_exit_code = baseline.exit_code
+        if baseline.exit_code == 127 and baseline.output.startswith("Cannot start"):
+            raise VerificationGateError(f"Verification command cannot run: {baseline.output}")
+        if baseline.is_green(contract.min_tests_collected):
+            if not green_baseline_attested_by:
+                raise VerificationGateError(
+                    "Negative control failed: the verification command already PASSES before any "
+                    f"implementation (exit {baseline.exit_code}, {baseline.passed} passed, evidence={baseline.evidence}). "
+                    "A test that cannot fail verifies nothing. Write a test that fails on the current tree; "
+                    "for a regression guard on existing code a human must attest the green baseline "
+                    "(`telos contract-lock --allow-green-baseline`)."
+                )
+            self.record_attestation(
+                left_node.id, "green_baseline", green_baseline_attested_by,
+                green_baseline_rationale or "regression guard on existing behaviour",
+            )
+            contract.baseline_policy = "human_attested_green"
+        elif baseline.timed_out:
+            raise VerificationGateError(
+                f"Negative control inconclusive: the command timed out after {contract.timeout_seconds}s on the baseline."
+            )
 
         right_node = self.create_node(
             title=verifier_title,
@@ -484,7 +635,13 @@ class TelosService:
                 return None
             data = dict(row)
             data["active"] = bool(data["active"])
-            return LeaseRecord.model_validate(data)
+            lease = LeaseRecord.model_validate(data)
+            if not self.keyring.check(lease.security_view(), lease.seal):
+                raise IntegrityError(
+                    f"Lease {lease_id} fails its seal (agent, worktree path, baseline or token budget "
+                    f"edited outside Telos)."
+                )
+            return lease
 
     def _validate_fencing_token(self, node: TaskNode, lease_id: str, fencing_token: int) -> LeaseRecord:
         self.expire_stale_leases()
@@ -572,15 +729,69 @@ class TelosService:
         }
 
     def unquarantine_task(
-        self, task_id: str, rationale: str, reset_strikes: int = 0
+        self, task_id: str, rationale: str, actor: str, reset_strikes: int = 0
     ) -> TaskNode:
+        """Human-only release (CLI with interactive confirmation, TUI). Never exposed to agents over MCP."""
         node = self.get_node(task_id)
+        self.record_attestation(node.id, "unquarantine", actor, rationale)
         node.state = KanbanState.READY
         node.strike_count = max(0, reset_strikes)
         node.active_lease_id = None
-        if rationale:
-            node.concise_spec = f"{node.concise_spec}\n[Unquarantined]: {rationale}".strip()
+        node.concise_spec = f"{node.concise_spec}\n[Unquarantined by {actor}]: {rationale}".strip()
         return self.save_node(node)
+
+    def attest_done(self, task_id: str, actor: str, rationale: str) -> TaskNode:
+        """Human sign-off for tasks without a test gate (decisions, documents, external work)."""
+        node = self.get_node(task_id)
+        if node._integrity_error:
+            raise IntegrityError(f"Task {node.id} is tampered; unquarantine it after review first.")
+        has_gate = any(
+            e.relation == EdgeRelation.VERIFIES and e.target_id == node.id for e in self.load_all_edges()
+        )
+        if has_gate:
+            raise VerificationGateError(
+                f"Task {node.id} has a V-Model verification gate; it closes only through a passing receipt."
+            )
+        self.record_attestation(node.id, "done", actor, rationale)
+        node.state = KanbanState.DONE
+        node.active_lease_id = None
+        return self.save_node(node)
+
+    def reseal_workspace(self, actor: str, rationale: str) -> dict[str, Any]:
+        """
+        Human migration/repair: create this machine's key if missing and re-sign the current state.
+        DONE nodes without verifiable evidence keep DONE only through an explicit `reseal-done` attestation,
+        and every outstanding lease is revoked (it was issued under a key we can no longer vouch for).
+        """
+        if not actor or not rationale:
+            raise VerificationGateError("Reseal needs an actor and a rationale.")
+        self.keyring.create()
+        self._init_sqlite_wal()
+        with self._connect_sqlite() as conn:
+            conn.execute("UPDATE active_leases SET active = 0")
+
+        raw_cfg = self.telos_dir / "config.toml"
+        if raw_cfg.exists():
+            self._write_scope_config(ScopeConfig.model_validate(read_toml(raw_cfg)))
+        if self.edges_file.exists():
+            raw_edges = read_toml(self.edges_file).get("edges", [])
+            self._save_edges([GraphEdge.model_validate(e) for e in raw_edges])
+        else:
+            self._save_edges([])
+
+        resealed: list[str] = []
+        attested_done: list[str] = []
+        for p in sorted(self.nodes_dir.glob("*.toml")) if self.nodes_dir.exists() else []:
+            node = TaskNode.model_validate(read_toml(p))
+            if node.state in (KanbanState.LEASED, KanbanState.VERIFYING):
+                node.state = KanbanState.READY
+            node.active_lease_id = None
+            if node.state == KanbanState.DONE and not self.has_done_evidence(node):
+                self.record_attestation(node.id, "reseal-done", actor, rationale)
+                attested_done.append(node.id)
+            self.save_node(node)
+            resealed.append(node.id)
+        return {"resealed_nodes": len(resealed), "done_attested_on_reseal": attested_done, "key": str(self.keyring.key_path)}
 
     def checkout_leaf(
         self,
@@ -597,11 +808,18 @@ class TelosService:
         """
         self.expire_stale_leases()
         node = self.get_node(task_id)
+        if node._integrity_error:
+            raise IntegrityError(
+                f"Task {node.id} is QUARANTINED for tampering ({node._integrity_error}). "
+                f"A human must review and run `telos unquarantine`."
+            )
         if node.state == KanbanState.QUARANTINED:
             raise VerificationGateError(
                 f"Task {node.id} is QUARANTINED after {node.strike_count} strikes. "
-                f"Decompose via Mikado or run `telos unquarantine` after review."
+                f"Decompose via Mikado or ask a human to run `telos unquarantine` after review."
             )
+        if node.state == KanbanState.DONE:
+            raise VerificationGateError(f"Task {node.id} is already DONE.")
 
         cfg = self.get_scope_config()
         if cfg and not ignore_wip_limit:
@@ -637,6 +855,20 @@ class TelosService:
                 f"Cannot lease non-leaf task {node.id}; unresolved prerequisites/children: {', '.join(all_blockers)}"
             )
 
+        verifiers = [
+            dag.nodes[e.source_id]
+            for e in dag.edges
+            if e.relation == EdgeRelation.VERIFIES and e.target_id == node.id and e.source_id in dag.nodes
+        ]
+        tampered_verifiers = [v.id for v in verifiers if v._integrity_error]
+        if tampered_verifiers:
+            raise IntegrityError(f"Verifier node(s) {', '.join(tampered_verifiers)} fail their seal.")
+        if not any(v.contract for v in verifiers):
+            raise VerificationGateError(
+                f"Task {node.id} has no locked verification contract. An architect (human CLI or "
+                f"`telos-mcp --role architect`) must lock a failing test before an implementer leases it."
+            )
+
         node.fencing_token += 1
         lease_record = LeaseRecord(
             task_id=node.id,
@@ -651,6 +883,7 @@ class TelosService:
             wt_path, base_sha = self.git_mgr.create_isolated_worktree(lease_record.lease_id)
             lease_record.worktree_path = str(wt_path)
             lease_record.baseline_commit_sha = base_sha
+        lease_record.seal = self.keyring.seal(lease_record.security_view())
 
         node.state = KanbanState.LEASED
         node.active_lease_id = lease_record.lease_id
@@ -665,8 +898,8 @@ class TelosService:
                 """
                 INSERT INTO active_leases
                 (lease_id, task_id, agent_id, fencing_token, worktree_path, baseline_commit_sha,
-                 token_budget_limit, tokens_consumed, acquired_at, expires_at, last_heartbeat_at, active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                 token_budget_limit, tokens_consumed, acquired_at, expires_at, last_heartbeat_at, active, seal)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
                 """,
                 (
                     lease_record.lease_id,
@@ -680,14 +913,10 @@ class TelosService:
                     lease_record.acquired_at.isoformat(),
                     lease_record.expires_at.isoformat(),
                     lease_record.last_heartbeat_at.isoformat(),
+                    lease_record.seal,
                 ),
             )
 
-        verifiers = [
-            dag.nodes[e.source_id]
-            for e in dag.edges
-            if e.relation == EdgeRelation.VERIFIES and e.target_id == node.id and e.source_id in dag.nodes
-        ]
         past_attempts = self.get_attempts_for_task(node.id)[-3:]
 
         return {
@@ -729,7 +958,6 @@ class TelosService:
         prerequisite_title: str,
         prerequisite_spec: str,
         why_blocked_rationale: str,
-        auto_checkout_prereq: bool = True,
     ) -> dict[str, Any]:
         blocked_node = self.get_node(blocked_task_id)
         lease = self._validate_fencing_token(blocked_node, lease_id, fencing_token)
@@ -771,15 +999,16 @@ class TelosService:
         with self._connect_sqlite() as conn:
             conn.execute("UPDATE active_leases SET active = 0 WHERE lease_id = ?", (lease.lease_id,))
 
-        result: dict[str, Any] = {
+        # The prerequisite is not leased automatically: like every task it needs an architect-locked,
+        # failing contract first, so the implementer that discovered it cannot also write its exam.
+        return {
             "blocked_task_id": blocked_node.id,
             "blocked_task_new_state": blocked_node.state.value,
             "snapshot_ref": snap_ref,
             "spawned_prerequisite_id": prereq_node.id,
+            "awaiting_contract": True,
+            "next_step": "An architect locks a failing contract on the prerequisite; then lease it.",
         }
-        if auto_checkout_prereq:
-            result["new_leaf_lease"] = self.checkout_leaf(prereq_node.id, lease.agent_id)
-        return result
 
     # -------------------------------------------------------------------------
     # Zero-Trust Verification Gate, Worktree Harvest & 3-Strike Breaker
@@ -811,13 +1040,17 @@ class TelosService:
                 f"Task {node.id} has no linked V-Model verification node (R3/R2/R1/R0). "
                 f"Approve a contract before submitting for verification."
             )
+        tampered_verifiers = [v.id for v in verifiers if v._integrity_error]
+        if tampered_verifiers:
+            raise IntegrityError(
+                f"Verifier node(s) {', '.join(tampered_verifiers)} fail their seal (contract edited outside Telos)."
+            )
 
         node.state = KanbanState.VERIFYING
         self.save_node(node)
 
         exec_dir = Path(lease.worktree_path)
-        all_receipts: list[str] = []
-        last_receipt: VerificationReceipt | None = None
+        passing: list[tuple[TaskNode, VerificationReceipt]] = []
 
         for v_node in verifiers:
             if not v_node.contract:
@@ -878,14 +1111,10 @@ class TelosService:
                     "receipt_id": receipt.receipt_id,
                 }
 
-            last_receipt = receipt
-            all_receipts.append(receipt.receipt_id)
-            v_node.state = KanbanState.DONE
-            v_node.last_verified_receipt_id = receipt.receipt_id
-            self.save_node(v_node)
+            passing.append((v_node, receipt))
 
         # Harvest verified changes from isolated worktree back to self.root & record git ref
-        assert last_receipt is not None
+        last_receipt = passing[-1][1]
         verified_ref = self.git_mgr.harvest_and_cleanup_worktree(
             worktree_path=exec_dir,
             task_id=node.id,
@@ -893,7 +1122,16 @@ class TelosService:
             baseline_sha=lease.baseline_commit_sha,
         )
         last_receipt.verified_git_ref = verified_ref
-        self._append_jsonl(self.receipts_file, last_receipt)
+        last_receipt.hmac_signature = self.verifier.sign_receipt(last_receipt)
+
+        # Receipts reach the ledger before any node claims DONE on their strength.
+        for _, receipt in passing:
+            self._append_jsonl(self.receipts_file, receipt)
+        for v_node, receipt in passing:
+            v_node.state = KanbanState.DONE
+            v_node.last_verified_receipt_id = receipt.receipt_id
+            self.save_node(v_node)
+        all_receipts = [r.receipt_id for _, r in passing]
 
         node.state = KanbanState.DONE
         node.active_lease_id = None
@@ -982,6 +1220,7 @@ class TelosService:
                 for l in leaves[:5]
             ],
             "quarantined_tasks": quarantined,
+            "integrity_violations": {n.id: n._integrity_error for n in dag.nodes.values() if n._integrity_error},
             "sub_projects": sub_summaries,
             "counts": {
                 "done": sum(1 for n in dag.nodes.values() if n.state == KanbanState.DONE),
@@ -1071,6 +1310,20 @@ class TelosService:
             raise ValueError(f"No valid Zwicky morphological candidate at index {candidate_rank_index}")
 
         winner = candidates[candidate_rank_index]
+        if box.selected_configuration is not None:
+            # Idempotent: a repeated commit (agent retry, double click) returns the existing ADR and tasks.
+            if box.selected_configuration != winner.configuration:
+                raise ValueError(
+                    f"Zwicky Box {box.id} is already committed to {box.selected_configuration}; "
+                    f"create a new box to revise the decision."
+                )
+            return {
+                "box_id": box.id,
+                "selected_configuration": box.selected_configuration,
+                "efficiency_rank_score": winner.efficiency_rank_score,
+                "spawned_node_ids": list(box.spawned_node_ids),
+                "already_committed": True,
+            }
         box.selected_configuration = winner.configuration
         box.decision_rationale = rationale
 
@@ -1110,10 +1363,16 @@ class TelosService:
     def bootstrap_agent_configs(self) -> dict[str, str]:
         """Generate .mcp.json and AGENTS.md / CLAUDE.md instructions for AI assistants."""
         mcp_json_path = self.root / ".mcp.json"
+        # Implementer surface only. An architect agent gets its own server entry with `--role architect`,
+        # configured by a human in that agent's harness, never alongside the implementer's.
+        mcp_cmd = shutil.which("telos-mcp")
+        if mcp_cmd is None:
+            sibling = Path(sys.executable).with_name("telos-mcp.exe" if os.name == "nt" else "telos-mcp")
+            mcp_cmd = str(sibling) if sibling.exists() else "telos-mcp"
         mcp_config = {
             "mcpServers": {
                 "telos": {
-                    "command": "telos-mcp",
+                    "command": mcp_cmd,
                     "args": [],
                 }
             }
@@ -1127,11 +1386,11 @@ To prevent context drift, local-optima loops, and reward hacking, follow this st
 
 1. **Orient (`telos_pulse` / `telos_waves`):** At the start of every session, call `telos_pulse` to inspect active leases, critical path tasks (`float_min=0`), and unblocked Mikado leaf tasks.
 2. **Design Complex Features (`telos_zwicky_create` / `telos_zwicky_solve` / `telos_zwicky_commit`):** Before decomposing ambiguous architectural features, evaluate dimensions and incompatibilities in a Zwicky Morphological Box.
-3. **Lock V-Model Contracts (`telos_contract_lock`):** Architect/Verifier agents lock test files and SHA-256 digests before an Implementer agent leases the task.
+3. **Contracts come from the architect, not you:** A task can only be leased once an architect (a human via `telos contract-lock`, or an agent running `telos-mcp --role architect`) has locked a test that FAILS on the current tree. If a task has no contract, say so and stop; do not write your own exam.
 4. **Lease Unblocked Leaves Only (`telos_checkout_leaf`):** Never edit code without an active `lease_id` and `fencing_token`. Respect Kanban WIP limits. Read `episodic_memory_do_not_repeat` in the checkout capsule so you never repeat a failed approach.
-5. **Pivot Immediately on Blockers (`telos_mikado_discover`):** If you hit an unmet prerequisite or failing upstream assumption, DO NOT brute-force edits across unrelated files. Call `telos_mikado_discover` to snapshot/reset the worktree, spawn the prerequisite leaf, and solve bottom-up.
+5. **Pivot Immediately on Blockers (`telos_mikado_discover`):** If you hit an unmet prerequisite or failing upstream assumption, DO NOT brute-force edits across unrelated files. Call `telos_mikado_discover` to snapshot/reset the worktree and record the prerequisite; it waits for an architect's contract.
 6. **Report Heartbeats (`telos_heartbeat`):** Report token usage during multi-step work.
-7. **Zero-Trust Verification (`telos_submit_verification`):** Never modify locked test files or add `@pytest.mark.skip`, `except: pass`, `except: ...`, or `sys.exit(0)`. Close tasks solely via `telos_submit_verification`.
+7. **Zero-Trust Verification (`telos_submit_verification`):** Close tasks solely via `telos_submit_verification`. Locked tests, conftest.py, pytest configuration and the `.telos/` files are sealed: changing them quarantines the task. Quarantine is released only by a human.
 """
         agents_md_path = self.root / "AGENTS.md"
         claude_md_path = self.root / "CLAUDE.md"

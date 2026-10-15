@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import StrEnum
-from pydantic import BaseModel, Field, model_validator
+from typing import Any
+
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 from telos.ulid import new_ulid
 
@@ -113,6 +115,12 @@ class VerificationContract(BaseModel):
     timeout_seconds: int = Field(default=120, gt=0)
     approved_by: str = "human-architect"
     approved_at: datetime = Field(default_factory=utc_now)
+    # Negative control: the command must FAIL on the pre-implementation tree, or a human attests otherwise.
+    baseline_policy: str = "must_fail"  # "must_fail" | "human_attested_green"
+    baseline_exit_code: int | None = None
+    # Harness surface (conftest.py, pytest config sections, site hooks, scripts) and top-level modules at lock.
+    harness_digests: dict[str, str] = Field(default_factory=dict)
+    module_names_at_lock: list[str] = Field(default_factory=list)
 
 
 class TaskNode(BaseModel):
@@ -135,6 +143,23 @@ class TaskNode(BaseModel):
     google_task_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+    seal: str = ""
+    _integrity_error: str | None = PrivateAttr(default=None)
+
+    def security_view(self) -> dict[str, Any]:
+        """Fields that open or close gates; sealed by Telos, free text (title, spec, labels) stays editable."""
+        return {
+            "id": self.id,
+            "kind": self.kind.value,
+            "state": self.state.value,
+            "strike_count": self.strike_count,
+            "max_strikes": self.max_strikes,
+            "fencing_token": self.fencing_token,
+            "active_lease_id": self.active_lease_id,
+            "last_verified_receipt_id": self.last_verified_receipt_id,
+            "contract": self.contract.model_dump(mode="json") if self.contract else None,
+            "token_cost": self.estimates.token_cost.model_dump(mode="json"),
+        }
 
 
 class GraphEdge(BaseModel):
@@ -166,6 +191,18 @@ class LeaseRecord(BaseModel):
     expires_at: datetime
     last_heartbeat_at: datetime = Field(default_factory=utc_now)
     active: bool = True
+    seal: str = ""
+
+    def security_view(self) -> dict[str, Any]:
+        return {
+            "lease_id": self.lease_id,
+            "task_id": self.task_id,
+            "agent_id": self.agent_id,
+            "fencing_token": self.fencing_token,
+            "worktree_path": self.worktree_path,
+            "baseline_commit_sha": self.baseline_commit_sha,
+            "token_budget_limit": self.token_budget_limit,
+        }
 
 
 class AttemptRecord(BaseModel):
@@ -197,6 +234,7 @@ class VerificationReceipt(BaseModel):
     tests_skipped: int
     ast_violations: list[str] = Field(default_factory=list)
     verified_git_ref: str | None = None
+    evidence: str = "exit_code"  # "junit" (structured runner report) | "exit_code"
     duration_seconds: float
     executed_at: datetime = Field(default_factory=utc_now)
     hmac_signature: str = ""
@@ -208,7 +246,30 @@ class VerificationReceipt(BaseModel):
             f"{self.lease_id}|{self.fencing_token}|{self.source_tree_digest}|"
             f"{self.test_tree_digest}|{argv_str}|{self.exit_code}|"
             f"{self.tests_collected}|{self.tests_passed}|{self.tests_failed}|"
-            f"{self.tests_skipped}|{','.join(self.ast_violations)}"
+            f"{self.tests_skipped}|{','.join(self.ast_violations)}|"
+            f"{self.verified_git_ref or ''}|{self.evidence}"
+        )
+
+    @property
+    def is_pass(self) -> bool:
+        return self.exit_code == 0 and self.tests_failed == 0 and self.tests_collected > 0
+
+
+class AttestationRecord(BaseModel):
+    """Signed human decision: unquarantine, DONE without a test gate, green baseline, or reseal migration."""
+
+    attestation_id: str = Field(default_factory=new_ulid)
+    task_id: str
+    action: str
+    actor: str
+    rationale: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+    hmac_signature: str = ""
+
+    def canonical_payload(self) -> str:
+        return (
+            f"{self.attestation_id}|{self.task_id}|{self.action}|{self.actor}|"
+            f"{self.rationale}|{self.created_at.isoformat()}"
         )
 
 
@@ -249,4 +310,8 @@ class ScopeConfig(BaseModel):
     max_wip_per_agent: int = Field(default=1, ge=1)
     max_wip_total: int = Field(default=4, ge=1)
     created_at: datetime = Field(default_factory=utc_now)
+    seal: str = ""
+
+    def security_view(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"seal"})
 

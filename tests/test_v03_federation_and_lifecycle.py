@@ -13,6 +13,7 @@ import pytest
 from telos.mcp_server import TelosMcpDispatcher
 from telos.models import EdgeRelation, KanbanState, NodeKind
 from telos.service import TelosService, VerificationGateError
+from tests.conftest import lock_failing_gate
 
 
 def test_cross_scope_super_and_sub_project_federation(tmp_path: Path) -> None:
@@ -65,14 +66,17 @@ def test_cross_scope_super_and_sub_project_federation(tmp_path: Path) -> None:
     # Federated CPM includes external prerequisite duration (30m + 20m = 50m)
     assert radar_before["critical_path_remaining_min"] == 50.0
 
-    # 3. Complete sub_task in sub-project
+    # 3. Complete sub_task in sub-project (a plain state write is refused; DONE needs signed evidence)
     sub_task.state = KanbanState.DONE
-    sub_svc.save_node(sub_task)
+    with pytest.raises(VerificationGateError, match="cannot be DONE"):
+        sub_svc.save_node(sub_task)
+    sub_svc.attest_done(sub_task.id, actor="human-lead", rationale="Driver accepted on the bench")
 
     # 4. Now super_task is unblocked and ready for checkout
     radar_after = super_svc.pulse_radar()
     assert len(radar_after["ready_mikado_leaves"]) == 1
     assert radar_after["sub_projects"][0]["done"] == 1
+    lock_failing_gate(super_svc, super_dir, super_task.id, name="control_loop")
     lease = super_svc.checkout_leaf(super_task.id, agent_id="agent-super")
     assert lease["task_id"] == super_task.id
 
@@ -105,6 +109,7 @@ def test_vmodel_bottom_up_contains_synthesis_and_token_budget_breaker(tmp_path: 
         svc.checkout_leaf(parent_l2.id, agent_id="agent-1")
 
     # Lease child_l3 and report token consumption exceeding pessimistic budget (5000 tokens)
+    lock_failing_gate(svc, tmp_path, child_l3.id, name="signer")
     lease = svc.checkout_leaf(child_l3.id, agent_id="agent-1")
     hb_ok = svc.report_heartbeat(
         child_l3.id, lease["lease_id"], lease["fencing_token"], tokens_delta=3000
@@ -119,7 +124,9 @@ def test_vmodel_bottom_up_contains_synthesis_and_token_budget_breaker(tmp_path: 
     assert hb_over["state"] == KanbanState.QUARANTINED.value
 
     # Recover via official unquarantine_task service method
-    recovered = svc.unquarantine_task(child_l3.id, rationale="Increased context efficiency")
+    recovered = svc.unquarantine_task(
+        child_l3.id, rationale="Increased context efficiency", actor="human-architect"
+    )
     assert recovered.state == KanbanState.READY
     assert recovered.strike_count == 0
 
@@ -169,4 +176,4 @@ def test_zwicky_commit_spawns_traced_vmodel_nodes_and_bootstrap(tmp_path: Path) 
     # Test JSON-RPC dispatcher protocol message handling (used by stdio & Streamable HTTP)
     dispatcher = TelosMcpDispatcher(tmp_path)
     init_resp = dispatcher.handle_jsonrpc_message({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
-    assert init_resp["result"]["serverInfo"]["version"] in ("0.3.0", "0.4.0")
+    assert init_resp["result"]["serverInfo"]["version"] == "0.5.0"

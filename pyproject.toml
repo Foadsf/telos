@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "telos-harness"
-version = "0.4.0"
+version = "0.5.0"
 description = "Deterministic Cognitive Exoskeleton & Project Management Harness for AI Agents"
 readme = "README.md"
 license = { text = "Apache-2.0" }

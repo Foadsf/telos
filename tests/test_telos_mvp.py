@@ -25,6 +25,7 @@ from telos.models import (
     ZwickyPairAssessment,
 )
 from telos.service import StaleFencingTokenError, TelosService, VerificationGateError
+from tests.conftest import lock_failing_gate
 
 def test_pert_monotonic_invariant_enforced() -> None:
     """Rejects P < M or M < O so negative standard deviations can never exist."""
@@ -72,6 +73,7 @@ def test_mikado_discovery_and_stale_fencing_token_rejection(tmp_path: Path) -> N
     svc.init_workspace("mikado-test")
 
     goal = svc.create_node("Implement Auth API", state=KanbanState.READY)
+    lock_failing_gate(svc, tmp_path, goal.id, name="auth")
     lease_1 = svc.checkout_leaf(goal.id, agent_id="agent-alpha")
     assert lease_1["fencing_token"] == 1
 
@@ -90,7 +92,7 @@ def test_mikado_discovery_and_stale_fencing_token_rejection(tmp_path: Path) -> N
             why_blocked_rationale="Missing key loader",
         )
 
-    # Authoritative lease_2 with fencing_token=2 succeeds and auto-checks out new prerequisite leaf
+    # Authoritative lease_2 with fencing_token=2 succeeds; the prerequisite waits for an architect's contract
     pivot = svc.mikado_discover_prerequisite(
         blocked_task_id=goal.id,
         lease_id=lease_2["lease_id"],
@@ -101,7 +103,11 @@ def test_mikado_discovery_and_stale_fencing_token_rejection(tmp_path: Path) -> N
     )
     prereq_id = pivot["spawned_prerequisite_id"]
     assert pivot["blocked_task_new_state"] == KanbanState.MIKADO_DISCOVERY.value
-    assert pivot["new_leaf_lease"]["task_id"] == prereq_id
+    assert pivot["awaiting_contract"] is True
+    with pytest.raises(VerificationGateError, match="no locked verification contract"):
+        svc.checkout_leaf(prereq_id, agent_id="agent-beta")
+    lock_failing_gate(svc, tmp_path, prereq_id, name="keyloader")
+    assert svc.checkout_leaf(prereq_id, agent_id="agent-beta")["task_id"] == prereq_id
 
     # Goal is no longer a leaf; cannot be checked out until prereq is DONE
     with pytest.raises(VerificationGateError, match="unresolved prerequisites"):
@@ -139,14 +145,13 @@ def test_anti_reward_hacking_verifier_and_circuit_breaker(tmp_path: Path) -> Non
 
     lease = svc.checkout_leaf(task.id, agent_id="claude-code")
 
-    # Role-separation check: leased implementer cannot overwrite its own contract
-    with pytest.raises(VerificationGateError, match="Role separation violation"):
+    # Role-separation check: once leased, nobody can add or swap a contract (no caller ID involved)
+    with pytest.raises(VerificationGateError, match="locked before any lease"):
         svc.approve_verification_contract(
             left_node_id=task.id,
             verifier_title="Weakened contract",
             command_argv=[sys.executable, "-c", "print('1 passed')"],
             locked_paths=["test_calc.py"],
-            active_agent_id="claude-code",
         )
 
     # Attempt 1: Agent fails the unit test legitimately -> Strike 1/3
@@ -165,11 +170,8 @@ def test_anti_reward_hacking_verifier_and_circuit_breaker(tmp_path: Path) -> Non
     assert res2["failure_category"] == "ast_cheat_detected"
     assert res2["state"] == KanbanState.QUARANTINED.value
 
-    # Human architect resets quarantine and agent fixes implementation cleanly
-    node_reloaded = svc.get_node(task.id)
-    node_reloaded.state = KanbanState.READY
-    node_reloaded.strike_count = 0
-    svc.save_node(node_reloaded)
+    # Human architect releases the quarantine (signed attestation) and agent fixes implementation cleanly
+    svc.unquarantine_task(task.id, rationale="Reviewed the except-pass attempt", actor="human-architect")
 
     lease_clean = svc.checkout_leaf(task.id, agent_id="claude-code")
     src_file.write_text("def add(a: int, b: int) -> int:\n    return a + b\n", encoding="utf-8")
@@ -224,14 +226,7 @@ def test_zwicky_morphological_cca_solver_and_google_sync_gate(tmp_path: Path) ->
 
     # Verify Google Tasks mobile checkbox cannot mark a gated code task DONE
     t_code = svc.create_node("Critical Code Task", state=KanbanState.READY)
-    dummy_test = tmp_path / "t.py"
-    dummy_test.write_text("def test_ok(): assert True\n", encoding="utf-8")
-    svc.approve_verification_contract(
-        left_node_id=t_code.id,
-        verifier_title="Gate",
-        command_argv=[sys.executable, "-m", "pytest", "t.py"],
-        locked_paths=["t.py"],
-    )
+    lock_failing_gate(svc, tmp_path, t_code.id, name="critical")
     adapter = GoogleTasksProjectionAdapter(svc)
     remote_payload = {
         "id": "gtask-123",

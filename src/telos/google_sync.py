@@ -89,8 +89,11 @@ class GoogleTasksProjectionAdapter:
                     "state": node.state.value,
                     "reason": "Task requires signed V-Model VerificationReceipt before DONE.",
                 }
-            node.state = KanbanState.DONE
-            self.service.save_node(node)
+            self.service.attest_done(
+                node.id,
+                actor=f"google-tasks:{remote_task.get('id', 'unknown')}",
+                rationale="Completed by its human owner in Google Tasks",
+            )
             return {"action": "marked_human_task_done", "task_id": node.id}
 
         return {"action": "in_sync", "task_id": node.id, "state": node.state.value}

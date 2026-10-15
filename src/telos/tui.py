@@ -111,7 +111,9 @@ class TelosTuiApp(App[None]):
             return
         node = self.service.get_node(self._selected_task_id)
         if node.state == KanbanState.QUARANTINED:
-            self.service.unquarantine_task(node.id, rationale="Unquarantined via TUI operator action")
+            self.service.unquarantine_task(
+                node.id, rationale="Unquarantined via TUI operator action", actor="tui-operator"
+            )
             self.action_refresh_state()
 
     def action_refresh_state(self) -> None:

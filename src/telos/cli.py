@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 from pathlib import Path
 import sys
@@ -11,12 +12,34 @@ from typing import Any
 from rich.console import Console
 from rich.table import Table
 
-from telos.mcp_server import format_toon, run_stdio_jsonrpc_server, run_streamable_http_server
+from telos.mcp_server import ROLES, format_toon, run_stdio_jsonrpc_server, run_streamable_http_server
 from telos.models import EdgeRelation, KanbanState, NodeKind
-from telos.service import TelosService
+from telos.service import CREATABLE_STATES, TelosService
 from telos.web_gui import export_dashboard_file, serve_web_gui
 
 console = Console()
+
+
+class HumanGateError(PermissionError):
+    """Raised when a human-only command is run without an interactive terminal or confirmation."""
+
+
+def _confirm_human(action: str, subject: str) -> str:
+    """
+    Human gate for decisions an implementer agent must not take: an interactive terminal plus a typed
+    confirmation. It stops agents that act through MCP or non-interactive shells; it is not a security
+    boundary against an agent that drives a real terminal (see README, Trust model).
+    """
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise HumanGateError(
+            f"`{action}` is human-only and needs an interactive terminal. "
+            f"Ask the human to run it; agents cannot release gates."
+        )
+    token = subject[-6:] if subject else action
+    typed = input(f"[telos] Human confirmation for {action} on '{subject}'. Type '{token}' to confirm: ").strip()
+    if typed != token:
+        raise HumanGateError(f"Confirmation for `{action}` did not match; nothing changed.")
+    return f"{getpass.getuser()}@tty"
 
 
 def _emit(data: Any, fmt: str) -> None:
@@ -53,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("title", help="Task title")
     p_add.add_argument("--spec", default="", help="Concise specification")
     p_add.add_argument("--kind", default="L3_implementation", choices=[k.value for k in NodeKind])
-    p_add.add_argument("--state", default="ready", choices=[s.value for s in KanbanState])
+    p_add.add_argument("--state", default="ready", choices=[s.value for s in CREATABLE_STATES])
     p_add.add_argument("--category", default="general")
     p_add.add_argument("--label", action="append", default=[])
     p_add.add_argument("--opt-min", type=float, default=15.0)
@@ -64,12 +87,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--depends-on-scope", default=None, help="Relative path to external scope for --depends-on")
 
     # 3. contract-lock
-    p_lock = sub.add_parser("contract-lock", help="Lock a V-Model verification contract and SHA-256 tree digests")
+    p_lock = sub.add_parser(
+        "contract-lock", help="[human] Lock a failing verification contract before any lease (negative control)"
+    )
     p_lock.add_argument("left_node_id", help="Target Left-Wing implementation/spec node ID")
     p_lock.add_argument("--title", default="Verify implementation", help="Right-Wing verifier title")
     p_lock.add_argument("--path", action="append", required=True, help="Test/config path to SHA-256 lock")
     p_lock.add_argument("--scan-path", action="append", default=[], help="Source path for AST anti-cheat scan")
     p_lock.add_argument("--min-tests", type=int, default=1)
+    p_lock.add_argument(
+        "--allow-green-baseline",
+        default=None,
+        metavar="RATIONALE",
+        help="Accept a command that already passes (regression guard); recorded as a signed human attestation",
+    )
     p_lock.add_argument("cmd", nargs="*", help="Verification command argv (e.g. pytest -q)")
 
     # 4. pulse & waves
@@ -106,9 +137,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_ver.add_argument("--token", type=int, required=True, help="Fencing token")
 
     # 9. unquarantine
-    p_unq = sub.add_parser("unquarantine", help="Release a QUARANTINED task back to READY after review")
+    p_unq = sub.add_parser("unquarantine", help="[human] Release a QUARANTINED task back to READY after review")
     p_unq.add_argument("task_id")
     p_unq.add_argument("--rationale", required=True, help="Explanation of fix or architectural adjustment")
+
+    p_att = sub.add_parser("attest-done", help="[human] Mark a task without a test gate DONE (signed attestation)")
+    p_att.add_argument("task_id")
+    p_att.add_argument("--rationale", required=True)
+
+    p_reseal = sub.add_parser(
+        "reseal", help="[human] Create this machine's key if missing and re-sign the reviewed workspace state"
+    )
+    p_reseal.add_argument("--rationale", required=True)
 
     # 10. schedule
     p_sched = sub.add_parser("schedule", help="Compute deterministic CPM and Monte Carlo Beta-PERT schedule")
@@ -143,6 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_mcp = sub.add_parser("mcp", help="Run MCP server (stdio by default, or Streamable HTTP with --http-port)")
     p_mcp.add_argument("--http-port", type=int, default=None, help="Run Streamable HTTP server on this port")
+    p_mcp.add_argument("--role", choices=ROLES, default="implementer", help="Tool surface for this server")
 
     return parser
 
@@ -151,6 +192,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     service = TelosService(args.root)
+    try:
+        return _dispatch(parser, args, service)
+    except HumanGateError as exc:
+        sys.stderr.write(f"telos: {exc}\n")
+        return 3
+
+
+def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace, service: TelosService) -> int:
 
     if args.command == "init":
         cfg = service.init_workspace(
@@ -193,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         cmd_argv = [c for c in args.cmd if c != "--"]
         if not cmd_argv:
             parser.error("Provide a verification command after options (e.g., -- pytest -q)")
+        actor = _confirm_human("contract-lock", args.left_node_id)
         l_node, r_node = service.approve_verification_contract(
             left_node_id=args.left_node_id,
             verifier_title=args.title,
@@ -200,6 +250,9 @@ def main(argv: list[str] | None = None) -> int:
             locked_paths=args.path,
             ast_scan_paths=args.scan_path or args.path,
             min_tests_collected=args.min_tests,
+            approved_by=actor,
+            green_baseline_attested_by=actor if args.allow_green_baseline else None,
+            green_baseline_rationale=args.allow_green_baseline or "",
         )
         _emit(
             {
@@ -250,8 +303,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if res["passed"] else 1
 
     if args.command == "unquarantine":
-        node = service.unquarantine_task(args.task_id, args.rationale)
+        actor = _confirm_human("unquarantine", args.task_id)
+        node = service.unquarantine_task(args.task_id, args.rationale, actor=actor)
         _emit(node.model_dump(mode="json"), args.format)
+        return 0
+
+    if args.command == "attest-done":
+        actor = _confirm_human("attest-done", args.task_id)
+        node = service.attest_done(args.task_id, actor=actor, rationale=args.rationale)
+        _emit(node.model_dump(mode="json"), args.format)
+        return 0
+
+    if args.command == "reseal":
+        actor = _confirm_human("reseal", str(service.root))
+        _emit(service.reseal_workspace(actor=actor, rationale=args.rationale), args.format)
         return 0
 
     if args.command == "schedule":
@@ -332,9 +397,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "mcp":
         if args.http_port is not None:
-            run_streamable_http_server(args.root, port=args.http_port)
+            run_streamable_http_server(args.root, port=args.http_port, role=args.role)
         else:
-            run_stdio_jsonrpc_server(args.root)
+            run_stdio_jsonrpc_server(args.root, role=args.role)
         return 0
 
     return 0

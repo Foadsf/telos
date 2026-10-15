@@ -14,6 +14,7 @@ from telos.mcp_server import TelosMcpDispatcher
 from telos.models import KanbanState, NodeKind, PertTriplet, ZwickyBox, ZwickyOption, ZwickyPairAssessment, ZwickyCompatibility
 from telos.service import TelosService
 from telos.ulid import new_ulid
+from tests.conftest import lock_failing_gate
 
 def test_ulid_monotonic_and_distinct() -> None:
     ids = [new_ulid() for _ in range(100)]
@@ -50,7 +51,8 @@ def test_cli_lifecycle(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> No
     pulse_data = json.loads(capsys.readouterr().out)
     assert pulse_data["counts"]["total"] >= 2
 
-    # 5. checkout leaf
+    # 5. architect locks a failing contract (library call stands in for the human CLI), then checkout leaf
+    lock_failing_gate(TelosService(tmp_path), tmp_path, task_id, name="task1")
     rc = cli_main(["--root", str(tmp_path), "--format", "json", "checkout", task_id, "--agent", "test-agent"])
     assert rc == 0
     co_data = json.loads(capsys.readouterr().out)
@@ -67,7 +69,7 @@ def test_cli_lifecycle(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> No
     assert rc == 0
     mik_data = json.loads(capsys.readouterr().out)
     assert mik_data["blocked_task_id"] == task_id
-    assert "new_leaf_lease" in mik_data
+    assert mik_data["awaiting_contract"] is True
 
     # 7. schedule
     rc = cli_main(["--root", str(tmp_path), "--format", "json", "schedule", "--trials", "500"])
@@ -111,7 +113,8 @@ def test_mcp_dispatcher_tools(tmp_path: Path) -> None:
             task_id = line.split(":", 1)[1].strip()
     assert task_id is not None
 
-    # 4. checkout via MCP
+    # 4. checkout via MCP (after an architect-side lock)
+    lock_failing_gate(svc, tmp_path, task_id, name="backend")
     co_res = dispatcher.call_tool("telos_checkout_leaf", {"task_id": task_id, "agent_id": "mcp-agent"})
     assert "lease_id:" in co_res
     lease_id = None
