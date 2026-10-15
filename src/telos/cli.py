@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_lock.add_argument("--path", action="append", required=True, help="Test/config path to SHA-256 lock")
     p_lock.add_argument("--scan-path", action="append", default=[], help="Source path for AST anti-cheat scan")
     p_lock.add_argument("--min-tests", type=int, default=1)
-    p_lock.add_argument("cmd", nargs=argparse.REMAINDER, help="Verification command argv (e.g. pytest -q)")
+    p_lock.add_argument("cmd", nargs="*", help="Verification command argv (e.g. pytest -q)")
 
     # 4. pulse
     p_pulse = sub.add_parser("pulse", help="Display L0 Agent Radar (leases, critical path, ready Mikado leaves)")
