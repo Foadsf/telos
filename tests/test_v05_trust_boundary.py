@@ -22,7 +22,6 @@ from telos.mcp_server import TelosMcpDispatcher
 from telos.models import EdgeRelation, KanbanState, VerificationReceipt
 from telos.service import TelosService, VerificationGateError
 from telos.toml_codec import read_toml, write_canonical_toml
-from tests.conftest import lock_failing_gate
 
 
 def _field(toon: str, key: str) -> str:
