@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "telos-harness"
+version = "0.2.0"
+description = "Deterministic Cognitive Exoskeleton & Project Management Harness for AI Agents"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.6.0",
+    "rich>=13.7.0",
+    "textual>=0.80.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2.0"]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+telos = "telos.cli:main"
+telos-mcp = "telos.mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/telos"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "--basetemp=.pytest_tmp"
