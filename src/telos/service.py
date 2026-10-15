@@ -8,6 +8,8 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 
+from pydantic import BaseModel
+
 from telos.dag_pert import CpmNodeSchedule, DagEngine, MonteCarloScheduleResult
 from telos.git_worktree import GitPlumbingManager
 from telos.models import (
@@ -25,17 +27,23 @@ from telos.models import (
     VerificationContract,
     VerificationReceipt,
     ZwickyBox,
+    ZwickyCompatibility,
+    ZwickyOption,
+    ZwickyPairAssessment,
     utc_now,
 )
 from telos.toml_codec import read_toml, write_canonical_toml
 from telos.verifier import TrustedVerifier
 from telos.zwicky import MorphologicalCandidate, ZwickySolver
 
+
 class StaleFencingTokenError(PermissionError):
     """Raised when an agent presents an expired or superseded lease fencing token."""
 
+
 class VerificationGateError(PermissionError):
     """Raised when attempting an illegal state transition or self-approval."""
+
 
 class TelosService:
     """Single authoritative application service for CLI, MCP, and TUI consumers."""
@@ -76,11 +84,16 @@ class TelosService:
         cfg_path = self.telos_dir / "config.toml"
         if cfg_path.exists():
             cfg = ScopeConfig.model_validate(read_toml(cfg_path))
+            if super_project_path is not None:
+                cfg.super_project_path = super_project_path
+            if sub_project_paths:
+                cfg.sub_project_paths = sorted(set(cfg.sub_project_paths + sub_project_paths))
+            write_canonical_toml(cfg_path, cfg.model_dump(mode="json"))
         else:
             cfg = ScopeConfig(
                 project_name=project_name,
                 super_project_path=super_project_path,
-                sub_project_paths=sub_project_paths or [],
+                sub_project_paths=sorted(set(sub_project_paths or [])),
             )
             write_canonical_toml(cfg_path, cfg.model_dump(mode="json"))
 
@@ -93,6 +106,12 @@ class TelosService:
         self._init_sqlite_wal()
         self.rebuild_sqlite_index()
         return cfg
+
+    def get_scope_config(self) -> ScopeConfig | None:
+        cfg_path = self.telos_dir / "config.toml"
+        if not cfg_path.exists():
+            return None
+        return ScopeConfig.model_validate(read_toml(cfg_path))
 
     def _connect_sqlite(self) -> sqlite3.Connection:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -143,13 +162,39 @@ class TelosService:
                 """
             )
 
+    def _resolve_external_nodes(self, edges: list[GraphEdge]) -> dict[tuple[str, str], TaskNode | None]:
+        """Resolve cross-scope node references across federated sub/super project directories."""
+        external_map: dict[tuple[str, str], TaskNode | None] = {}
+        for edge in edges:
+            if not edge.scope_ref:
+                continue
+            ext_root = (self.root / edge.scope_ref).resolve()
+            ext_nodes_dir = ext_root / ".telos" / "nodes"
+            node_obj: TaskNode | None = None
+            if ext_nodes_dir.exists():
+                exact = ext_nodes_dir / f"{edge.target_id}.toml"
+                if exact.exists():
+                    node_obj = TaskNode.model_validate(read_toml(exact))
+                else:
+                    matches = list(ext_nodes_dir.glob(f"{edge.target_id}*.toml"))
+                    if len(matches) == 1:
+                        node_obj = TaskNode.model_validate(read_toml(matches[0]))
+            external_map[(edge.scope_ref, edge.target_id)] = node_obj
+        return external_map
+
+    def build_dag_engine(self) -> DagEngine:
+        nodes = self.load_all_nodes()
+        edges = self.load_all_edges()
+        ext_nodes = self._resolve_external_nodes(edges)
+        return DagEngine(nodes, edges, external_nodes=ext_nodes)
+
     def rebuild_sqlite_index(self) -> None:
         """Synchronize Git-tracked TOML files into the SQLite WAL index and validate DAG acyclicity."""
         self._init_sqlite_wal()
         nodes = self.load_all_nodes()
         edges = self.load_all_edges()
-        # Post-merge semantic validation: ensures Git merges didn't introduce a dependency cycle
-        dag = DagEngine(nodes, edges)
+        ext_nodes = self._resolve_external_nodes(edges)
+        dag = DagEngine(nodes, edges, external_nodes=ext_nodes)
         dag.validate_acyclic()
 
         with self._connect_sqlite() as conn:
@@ -200,7 +245,6 @@ class TelosService:
     def get_node(self, node_id: str) -> TaskNode:
         path = self._node_path(node_id)
         if not path.exists():
-            # Allow prefix matching for CLI convenience
             matches = list(self.nodes_dir.glob(f"{node_id}*.toml"))
             if len(matches) == 1:
                 path = matches[0]
@@ -240,7 +284,11 @@ class TelosService:
         nodes = self.load_all_nodes()
         if source_id not in nodes:
             source_id = self.get_node(source_id).id
-        if not scope_ref and target_id not in nodes:
+        if relation == EdgeRelation.DERIVED_FROM:
+            z_boxes = self.load_all_zwicky_boxes()
+            if target_id not in z_boxes:
+                target_id = self.get_zwicky_box(target_id).id
+        elif not scope_ref and target_id not in nodes:
             target_id = self.get_node(target_id).id
 
         new_edge = GraphEdge(
@@ -249,7 +297,7 @@ class TelosService:
         edges = self.load_all_edges()
         candidate_edges = edges + [new_edge]
 
-        if relation == EdgeRelation.DEPENDS_ON and not scope_ref:
+        if relation in (EdgeRelation.DEPENDS_ON, EdgeRelation.CONTAINS) and not scope_ref:
             dag = DagEngine(nodes, candidate_edges)
             dag.validate_acyclic()
 
@@ -273,6 +321,7 @@ class TelosService:
         most_likely_tokens: float = 15000.0,
         pessimistic_tokens: float = 45000.0,
         parent_id: str | None = None,
+        derived_from_zwicky_id: str | None = None,
     ) -> TaskNode:
         estimates = ResourceEstimates(
             duration_minutes=PertTriplet(
@@ -295,11 +344,14 @@ class TelosService:
             group_name=group_name,
             labels=sorted(set(labels or [])),
             estimates=estimates,
+            derived_from_zwicky_id=derived_from_zwicky_id,
         )
         self.save_node(node)
         if parent_id:
             parent = self.get_node(parent_id)
             self.add_edge(parent.id, EdgeRelation.CONTAINS, node.id)
+        if derived_from_zwicky_id:
+            self.add_edge(node.id, EdgeRelation.DERIVED_FROM, derived_from_zwicky_id)
         return node
 
     def _append_jsonl(self, path: Path, record: BaseModel) -> None:
@@ -345,10 +397,6 @@ class TelosService:
         approved_by: str = "human-architect",
         active_agent_id: str | None = None,
     ) -> tuple[TaskNode, TaskNode]:
-        """
-        Create/bind a Right-Wing R* verification node to a Left-Wing L* node and lock tree SHA-256 digests.
-        Enforces Role Separation: an agent currently leasing the L* task cannot approve its own contract.
-        """
         left_node = self.get_node(left_node_id)
         if active_agent_id and left_node.active_lease_id:
             lease = self.get_lease(left_node.active_lease_id)
@@ -400,7 +448,7 @@ class TelosService:
         return left_node, right_node
 
     # -------------------------------------------------------------------------
-    # Lease Management, Fencing Tokens & Context Capsules
+    # Lease Management, Heartbeats, Token Circuit Breaker & Quarantine Recovery
     # -------------------------------------------------------------------------
     def expire_stale_leases(self) -> list[str]:
         now = utc_now()
@@ -449,36 +497,119 @@ class TelosService:
             )
         return lease
 
+    def report_heartbeat(
+        self,
+        task_id: str,
+        lease_id: str,
+        fencing_token: int,
+        tokens_delta: int = 0,
+        extend_ttl_minutes: int = 15,
+    ) -> dict[str, Any]:
+        """
+        Update lease heartbeat and token consumption.
+        Automatically trips the circuit breaker (QUARANTINED) if tokens_consumed > token_budget_limit.
+        """
+        node = self.get_node(task_id)
+        lease = self._validate_fencing_token(node, lease_id, fencing_token)
+        new_tokens = lease.tokens_consumed + max(0, tokens_delta)
+        now = utc_now()
+        new_expires = now + timedelta(minutes=extend_ttl_minutes)
+
+        if new_tokens > lease.token_budget_limit:
+            attempt = AttemptRecord(
+                task_id=node.id,
+                lease_id=lease.lease_id,
+                agent_id=lease.agent_id,
+                fencing_token=fencing_token,
+                category=FailureCategory.TOKEN_BUDGET_EXCEEDED,
+                rationale=(
+                    f"Token budget exceeded: consumed {new_tokens} > limit {lease.token_budget_limit}."
+                ),
+            )
+            snap_ref = self.git_mgr.snapshot_and_reset_worktree(
+                Path(lease.worktree_path), node.id, attempt.attempt_id, lease.baseline_commit_sha
+            )
+            attempt.git_snapshot_ref = snap_ref
+            self._append_jsonl(self.attempts_file, attempt)
+
+            node.strike_count = node.max_strikes
+            node.state = KanbanState.QUARANTINED
+            node.active_lease_id = None
+            self.save_node(node)
+
+            with self._connect_sqlite() as conn:
+                conn.execute(
+                    "UPDATE active_leases SET tokens_consumed = ?, active = 0 WHERE lease_id = ?",
+                    (new_tokens, lease.lease_id),
+                )
+            return {
+                "active": False,
+                "task_id": node.id,
+                "state": node.state.value,
+                "tokens_consumed": new_tokens,
+                "token_budget_limit": lease.token_budget_limit,
+                "diagnostic": "Circuit breaker tripped: token budget exceeded. Task QUARANTINED.",
+            }
+
+        with self._connect_sqlite() as conn:
+            conn.execute(
+                """
+                UPDATE active_leases
+                SET tokens_consumed = ?, last_heartbeat_at = ?, expires_at = ?
+                WHERE lease_id = ?
+                """,
+                (new_tokens, now.isoformat(), new_expires.isoformat(), lease.lease_id),
+            )
+
+        return {
+            "active": True,
+            "task_id": node.id,
+            "lease_id": lease.lease_id,
+            "tokens_consumed": new_tokens,
+            "token_budget_remaining": lease.token_budget_limit - new_tokens,
+            "expires_at": new_expires.isoformat(),
+        }
+
+    def unquarantine_task(
+        self, task_id: str, rationale: str, reset_strikes: int = 0
+    ) -> TaskNode:
+        """Human/Architect recovery action to release a task from QUARANTINED back to READY."""
+        node = self.get_node(task_id)
+        node.state = KanbanState.READY
+        node.strike_count = max(0, reset_strikes)
+        node.active_lease_id = None
+        if rationale:
+            node.concise_spec = f"{node.concise_spec}\n[Unquarantined]: {rationale}".strip()
+        return self.save_node(node)
+
     def checkout_leaf(
         self, task_id: str, agent_id: str, ttl_minutes: int = 30, create_worktree: bool = False
     ) -> dict[str, Any]:
         """
         Acquire an exclusive lease with a monotonically incremented fencing_token.
-        Returns a token-frugal L1 Context Capsule including past failed attempts so the agent avoids amnesia.
+        Verifies both local prerequisites/children AND federated cross-scope prerequisites are DONE.
         """
         self.expire_stale_leases()
-        nodes = self.load_all_nodes()
-        edges = self.load_all_edges()
         node = self.get_node(task_id)
-        nodes[node.id] = node
-
         if node.state == KanbanState.QUARANTINED:
             raise VerificationGateError(
                 f"Task {node.id} is QUARANTINED after {node.strike_count} strikes. "
-                f"Decompose via Mikado or reset strikes after human review."
+                f"Decompose via Mikado or run `telos unquarantine` after review."
             )
 
-        dag = DagEngine(nodes, edges)
-        unfinished_prereqs = [
-            pid for pid in dag.prereqs.get(node.id, set()) if nodes[pid].state != KanbanState.DONE
+        dag = self.build_dag_engine()
+        unfinished_local = [
+            pid for pid in dag.prereqs.get(node.id, set()) if dag.nodes[pid].state != KanbanState.DONE
         ]
-        if unfinished_prereqs:
+        unfinished_ext = dag.unresolved_external_blockers(node.id)
+        all_blockers = unfinished_local + unfinished_ext
+        if all_blockers:
             raise VerificationGateError(
-                f"Cannot lease non-leaf task {node.id}; unresolved prerequisites: {', '.join(unfinished_prereqs)}"
+                f"Cannot lease non-leaf task {node.id}; unresolved prerequisites/children: {', '.join(all_blockers)}"
             )
 
         node.fencing_token += 1
-        lease_record_id = LeaseRecord(
+        lease_record = LeaseRecord(
             task_id=node.id,
             agent_id=agent_id,
             fencing_token=node.fencing_token,
@@ -488,18 +619,18 @@ class TelosService:
             expires_at=utc_now() + timedelta(minutes=ttl_minutes),
         )
         if create_worktree:
-            wt_path, base_sha = self.git_mgr.create_isolated_worktree(lease_record_id.lease_id)
-            lease_record_id.worktree_path = str(wt_path)
-            lease_record_id.baseline_commit_sha = base_sha
+            wt_path, base_sha = self.git_mgr.create_isolated_worktree(lease_record.lease_id)
+            lease_record.worktree_path = str(wt_path)
+            lease_record.baseline_commit_sha = base_sha
 
         node.state = KanbanState.LEASED
-        node.active_lease_id = lease_record_id.lease_id
+        node.active_lease_id = lease_record.lease_id
         self.save_node(node)
 
         with self._connect_sqlite() as conn:
             conn.execute(
                 "UPDATE active_leases SET active = 0 WHERE task_id = ? AND lease_id != ?",
-                (node.id, lease_record_id.lease_id),
+                (node.id, lease_record.lease_id),
             )
             conn.execute(
                 """
@@ -509,24 +640,24 @@ class TelosService:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """,
                 (
-                    lease_record_id.lease_id,
-                    lease_record_id.task_id,
-                    lease_record_id.agent_id,
-                    lease_record_id.fencing_token,
-                    lease_record_id.worktree_path,
-                    lease_record_id.baseline_commit_sha,
-                    lease_record_id.token_budget_limit,
-                    lease_record_id.tokens_consumed,
-                    lease_record_id.acquired_at.isoformat(),
-                    lease_record_id.expires_at.isoformat(),
-                    lease_record_id.last_heartbeat_at.isoformat(),
+                    lease_record.lease_id,
+                    lease_record.task_id,
+                    lease_record.agent_id,
+                    lease_record.fencing_token,
+                    lease_record.worktree_path,
+                    lease_record.baseline_commit_sha,
+                    lease_record.token_budget_limit,
+                    lease_record.tokens_consumed,
+                    lease_record.acquired_at.isoformat(),
+                    lease_record.expires_at.isoformat(),
+                    lease_record.last_heartbeat_at.isoformat(),
                 ),
             )
 
         verifiers = [
-            nodes[e.source_id]
-            for e in edges
-            if e.relation == EdgeRelation.VERIFIES and e.target_id == node.id and e.source_id in nodes
+            dag.nodes[e.source_id]
+            for e in dag.edges
+            if e.relation == EdgeRelation.VERIFIES and e.target_id == node.id and e.source_id in dag.nodes
         ]
         past_attempts = self.get_attempts_for_task(node.id)[-3:]
 
@@ -534,11 +665,11 @@ class TelosService:
             "task_id": node.id,
             "title": node.title,
             "spec": node.concise_spec,
-            "lease_id": lease_record_id.lease_id,
-            "fencing_token": lease_record_id.fencing_token,
-            "worktree_path": lease_record_id.worktree_path,
+            "lease_id": lease_record.lease_id,
+            "fencing_token": lease_record.fencing_token,
+            "worktree_path": lease_record.worktree_path,
             "strikes": f"{node.strike_count}/{node.max_strikes}",
-            "token_budget": lease_record_id.token_budget_limit,
+            "token_budget": lease_record.token_budget_limit,
             "verification_gates": [
                 {
                     "verifier_id": v.id,
@@ -571,14 +702,6 @@ class TelosService:
         why_blocked_rationale: str,
         auto_checkout_prereq: bool = True,
     ) -> dict[str, Any]:
-        """
-        Record a newly discovered prerequisite via the Mikado Method:
-        1. Validate active lease & fencing_token.
-        2. Snapshot dirty worktree into refs/telos/attempts/<task>/<attempt> (no git stash) and reset worktree.
-        3. Create prerequisite node P1 and link blocked_task DEPENDS_ON P1.
-        4. Release blocked_task lease (moves to MIKADO_DISCOVERY without incrementing strike_count).
-        5. Optionally auto-checkout the new leaf P1.
-        """
         blocked_node = self.get_node(blocked_task_id)
         lease = self._validate_fencing_token(blocked_node, lease_id, fencing_token)
 
@@ -630,24 +753,33 @@ class TelosService:
         return result
 
     # -------------------------------------------------------------------------
-    # Zero-Trust Verification Gate & 3-Strike Circuit Breaker
+    # Zero-Trust Verification Gate, Bottom-Up V-Model Check & 3-Strike Breaker
     # -------------------------------------------------------------------------
     def submit_for_verification(
         self, task_id: str, lease_id: str, fencing_token: int
     ) -> dict[str, Any]:
         """
         Run all linked V-Model Right-Wing (R*) verification contracts for a leased Left-Wing (L*) task.
-        Agents cannot mark tasks DONE directly; only a signed VerificationReceipt transitions state to DONE.
+        Also enforces bottom-up V-Model synthesis: all CONTAINS children must be DONE first.
         """
         node = self.get_node(task_id)
         lease = self._validate_fencing_token(node, lease_id, fencing_token)
 
-        nodes = self.load_all_nodes()
-        edges = self.load_all_edges()
+        dag = self.build_dag_engine()
+        unfinished_children = [
+            cid for cid in dag.children_map.get(node.id, set())
+            if dag.nodes[cid].state != KanbanState.DONE
+        ]
+        if unfinished_children:
+            raise VerificationGateError(
+                f"V-Model bottom-up synthesis violation: parent node {node.id} cannot be verified "
+                f"until all CONTAINS child nodes are DONE (unfinished: {', '.join(unfinished_children)})."
+            )
+
         verifiers = [
-            nodes[e.source_id]
-            for e in edges
-            if e.relation == EdgeRelation.VERIFIES and e.target_id == node.id and e.source_id in nodes
+            dag.nodes[e.source_id]
+            for e in dag.edges
+            if e.relation == EdgeRelation.VERIFIES and e.target_id == node.id and e.source_id in dag.nodes
         ]
         if not verifiers:
             raise VerificationGateError(
@@ -686,11 +818,14 @@ class TelosService:
                     category=fail_cat,
                     rationale=message[:500],
                 )
-                if fail_cat in (FailureCategory.TEST_TAMPER_ATTEMPT, FailureCategory.AST_CHEAT_DETECTED):
+                if fail_cat in (
+                    FailureCategory.TEST_TAMPER_ATTEMPT,
+                    FailureCategory.AST_CHEAT_DETECTED,
+                    FailureCategory.TOKEN_BUDGET_EXCEEDED,
+                ):
                     node.strike_count = node.max_strikes
                 elif fail_cat == FailureCategory.AGENT_LOGIC_ERROR:
                     node.strike_count += 1
-                # Note: INFRA_OR_FLAKY_ENV does NOT increment strike_count
 
                 if node.strike_count >= node.max_strikes:
                     snap_ref = self.git_mgr.snapshot_and_reset_worktree(
@@ -722,6 +857,10 @@ class TelosService:
             v_node.last_verified_receipt_id = receipt.receipt_id
             self.save_node(v_node)
 
+        # Clean up isolated worktree if one was created
+        if exec_dir.resolve() != self.root.resolve():
+            self.git_mgr.remove_isolated_worktree(exec_dir)
+
         node.state = KanbanState.DONE
         node.active_lease_id = None
         node.last_verified_receipt_id = all_receipts[-1]
@@ -740,36 +879,52 @@ class TelosService:
         }
 
     def _auto_ready_dependents(self) -> list[str]:
-        """Transition MIKADO_DISCOVERY tasks back to READY once all their prerequisites reach DONE."""
-        nodes = self.load_all_nodes()
-        edges = self.load_all_edges()
-        dag = DagEngine(nodes, edges)
+        """Transition MIKADO_DISCOVERY or BLOCKED tasks back to READY once all local & external prerequisites reach DONE."""
+        dag = self.build_dag_engine()
         newly_ready: list[str] = []
-        for nid, node in nodes.items():
+        for nid, node in dag.nodes.items():
             if node.state in (KanbanState.MIKADO_DISCOVERY, KanbanState.BLOCKED):
                 prereqs = dag.prereqs.get(nid, set())
-                if prereqs and all(nodes[p].state == KanbanState.DONE for p in prereqs):
+                ext_unresolved = dag.unresolved_external_blockers(nid)
+                if (prereqs or dag.external_prereqs.get(nid)) and not ext_unresolved and all(
+                    dag.nodes[p].state == KanbanState.DONE for p in prereqs
+                ):
                     node.state = KanbanState.READY
                     self.save_node(node)
                     newly_ready.append(nid)
         return newly_ready
 
     # -------------------------------------------------------------------------
-    # L0 Token-Frugal Radar, Scheduling & Zwicky Operations
+    # L0 Token-Frugal Radar, Federated Rollup, Scheduling & Zwicky ADR Promotion
     # -------------------------------------------------------------------------
     def pulse_radar(self, agent_id: str | None = None) -> dict[str, Any]:
-        """Return compact L0 Radar (~120 tokens) for AI agent orientation."""
+        """Return compact L0 Radar (~120 tokens) for AI agent orientation, including federated sub-projects."""
         self.expire_stale_leases()
-        nodes = self.load_all_nodes()
-        edges = self.load_all_edges()
-        dag = DagEngine(nodes, edges)
+        self._auto_ready_dependents()
+        dag = self.build_dag_engine()
         cpm_map, cpm_total = dag.compute_cpm(include_done=False)
         leaves = dag.get_unblocked_mikado_leaves()
 
         leased_by_agent = [
-            n for n in nodes.values() if n.state == KanbanState.LEASED
+            n for n in dag.nodes.values() if n.state == KanbanState.LEASED
         ]
-        quarantined = [n.id for n in nodes.values() if n.state == KanbanState.QUARANTINED]
+        quarantined = [n.id for n in dag.nodes.values() if n.state == KanbanState.QUARANTINED]
+
+        cfg = self.get_scope_config()
+        sub_summaries: list[dict[str, Any]] = []
+        if cfg:
+            for sub_rel in cfg.sub_project_paths:
+                sub_root = (self.root / sub_rel).resolve()
+                if (sub_root / ".telos").exists():
+                    sub_svc = TelosService(sub_root)
+                    sub_nodes = sub_svc.load_all_nodes()
+                    sub_summaries.append(
+                        {
+                            "scope": sub_rel,
+                            "done": sum(1 for n in sub_nodes.values() if n.state == KanbanState.DONE),
+                            "total": len(sub_nodes),
+                        }
+                    )
 
         return {
             "active_leases": [
@@ -794,18 +949,17 @@ class TelosService:
                 for l in leaves[:5]
             ],
             "quarantined_tasks": quarantined,
+            "sub_projects": sub_summaries,
             "counts": {
-                "done": sum(1 for n in nodes.values() if n.state == KanbanState.DONE),
-                "total": len(nodes),
+                "done": sum(1 for n in dag.nodes.values() if n.state == KanbanState.DONE),
+                "total": len(dag.nodes),
             },
         }
 
     def compute_schedule(
         self, trials: int = 2000, seed: int = 42
     ) -> tuple[dict[str, CpmNodeSchedule], MonteCarloScheduleResult]:
-        nodes = self.load_all_nodes()
-        edges = self.load_all_edges()
-        dag = DagEngine(nodes, edges)
+        dag = self.build_dag_engine()
         cpm_schedules, _ = dag.compute_cpm(include_done=False)
         mc_result = dag.simulate_monte_carlo(trials=trials, seed=seed, include_done=False)
         return cpm_schedules, mc_result
@@ -814,6 +968,15 @@ class TelosService:
         path = self.zwicky_dir / f"{box.id}.toml"
         write_canonical_toml(path, box.model_dump(mode="json"))
         return box
+
+    def get_zwicky_box(self, box_id: str) -> ZwickyBox:
+        boxes = self.load_all_zwicky_boxes()
+        if box_id in boxes:
+            return boxes[box_id]
+        matches = [b for bid, b in boxes.items() if bid.startswith(box_id)]
+        if len(matches) == 1:
+            return matches[0]
+        raise KeyError(f"ZwickyBox '{box_id}' not found.")
 
     def load_all_zwicky_boxes(self) -> dict[str, ZwickyBox]:
         if not self.zwicky_dir.exists():
@@ -824,16 +987,126 @@ class TelosService:
             boxes[b.id] = b
         return boxes
 
+    def create_zwicky_box(
+        self,
+        title: str,
+        problem_statement: str,
+        dimensions: dict[str, list[dict[str, Any]]],
+        assessments: list[dict[str, Any]] | None = None,
+        max_cost_budget: float | None = None,
+    ) -> ZwickyBox:
+        parsed_dims = {
+            dim: [ZwickyOption.model_validate(opt) if isinstance(opt, dict) else ZwickyOption(name=str(opt)) for opt in opts]
+            for dim, opts in dimensions.items()
+        }
+        parsed_assessments = [
+            ZwickyPairAssessment.model_validate(a) for a in (assessments or [])
+        ]
+        box = ZwickyBox(
+            title=title,
+            problem_statement=problem_statement,
+            dimensions=parsed_dims,
+            assessments=parsed_assessments,
+            max_cost_budget=max_cost_budget,
+        )
+        return self.save_zwicky_box(box)
+
     def solve_zwicky_box(
         self, box_id: str, top_k: int = 5, forbid_unassessed: bool = False
     ) -> list[MorphologicalCandidate]:
-        boxes = self.load_all_zwicky_boxes()
-        if box_id not in boxes:
-            matches = [b for bid, b in boxes.items() if bid.startswith(box_id)]
-            if len(matches) != 1:
-                raise KeyError(f"ZwickyBox '{box_id}' not found.")
-            box = matches[0]
-        else:
-            box = boxes[box_id]
+        box = self.get_zwicky_box(box_id)
         solver = ZwickySolver(box)
         return solver.solve(top_k=top_k, forbid_unassessed=forbid_unassessed)
+
+    def commit_zwicky_configuration(
+        self,
+        box_id: str,
+        rationale: str,
+        candidate_rank_index: int = 0,
+        spawn_tasks: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Lock a winning Zwicky Morphological configuration as an Architecture Decision Record (ADR)
+        and optionally spawn traced L1_ARCHITECTURE / L2_MODULE_SPEC tasks linked via DERIVED_FROM.
+        """
+        box = self.get_zwicky_box(box_id)
+        candidates = self.solve_zwicky_box(box.id, top_k=max(5, candidate_rank_index + 1))
+        if not candidates or candidate_rank_index >= len(candidates):
+            raise ValueError(f"No valid Zwicky morphological candidate at index {candidate_rank_index}")
+
+        winner = candidates[candidate_rank_index]
+        box.selected_configuration = winner.configuration
+        box.decision_rationale = rationale
+
+        spawned_ids: list[str] = []
+        if spawn_tasks:
+            parent_arch = self.create_node(
+                title=f"Architecture: {box.title}",
+                concise_spec=(
+                    f"Morphological ADR ({box.id}): {rationale} | "
+                    f"Config: {json.dumps(winner.configuration, sort_keys=True)}"
+                ),
+                kind=NodeKind.L1_ARCHITECTURE,
+                state=KanbanState.READY,
+                derived_from_zwicky_id=box.id,
+            )
+            spawned_ids.append(parent_arch.id)
+            for dim, chosen_opt in sorted(winner.configuration.items()):
+                mod_node = self.create_node(
+                    title=f"Implement [{dim}]: {chosen_opt}",
+                    concise_spec=f"Derived from Zwicky Box '{box.title}' dimension '{dim}' = '{chosen_opt}'.",
+                    kind=NodeKind.L2_MODULE_SPEC,
+                    state=KanbanState.READY,
+                    parent_id=parent_arch.id,
+                    derived_from_zwicky_id=box.id,
+                )
+                spawned_ids.append(mod_node.id)
+
+        box.spawned_node_ids = spawned_ids
+        self.save_zwicky_box(box)
+        return {
+            "box_id": box.id,
+            "selected_configuration": winner.configuration,
+            "efficiency_rank_score": winner.efficiency_rank_score,
+            "spawned_node_ids": spawned_ids,
+        }
+
+    # -------------------------------------------------------------------------
+    # Agent Bootstrap Generator (.mcp.json + AGENTS.md + CLAUDE.md)
+    # -------------------------------------------------------------------------
+    def bootstrap_agent_configs(self) -> dict[str, str]:
+        """Generate .mcp.json and AGENTS.md / CLAUDE.md instructions for AI assistants."""
+        mcp_json_path = self.root / ".mcp.json"
+        mcp_config = {
+            "mcpServers": {
+                "telos": {
+                    "command": "telos-mcp",
+                    "args": [],
+                }
+            }
+        }
+        mcp_json_path.write_text(json.dumps(mcp_config, indent=2) + "\n", encoding="utf-8")
+
+        agent_rules = """# Telos Cognitive Exoskeleton Protocol (Mandatory for AI Agents)
+
+You are operating inside a **Telos** deterministic systems-engineering workspace (`.telos/`).
+To prevent context drift, local-optima loops, and reward hacking, follow this strict execution loop:
+
+1. **Orient (`telos_pulse`):** At the start of every session, call `telos_pulse` to inspect active leases, critical path tasks (`float_min=0`), and unblocked Mikado leaf tasks.
+2. **Design Complex Features (`telos_zwicky_create` / `telos_zwicky_commit`):** Before decomposing ambiguous architectural features, evaluate dimensions and incompatibilities in a Zwicky Morphological Box.
+3. **Lease Unblocked Leaves Only (`telos_checkout_leaf`):** Never edit code without an active `lease_id` and `fencing_token`. Read `episodic_memory_do_not_repeat` in the checkout capsule so you never repeat a failed approach.
+4. **Pivot Immediately on Blockers (`telos_mikado_discover`):** If you hit an unmet prerequisite or failing upstream assumption, DO NOT brute-force edits across unrelated files. Call `telos_mikado_discover` to snapshot/reset the worktree, spawn the prerequisite leaf, and solve bottom-up.
+5. **Report Heartbeats (`telos_heartbeat`):** Report token usage during multi-step work.
+6. **Zero-Trust Verification (`telos_submit_verification`):** Never modify locked test files or add `@pytest.mark.skip` / `except: pass`. Close tasks solely via `telos_submit_verification`.
+"""
+        agents_md_path = self.root / "AGENTS.md"
+        claude_md_path = self.root / "CLAUDE.md"
+        agents_md_path.write_text(agent_rules, encoding="utf-8")
+        if not claude_md_path.exists():
+            claude_md_path.write_text(agent_rules, encoding="utf-8")
+
+        return {
+            "mcp_config": str(mcp_json_path),
+            "agents_md": str(agents_md_path),
+            "claude_md": str(claude_md_path),
+        }

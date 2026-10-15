@@ -51,6 +51,7 @@ class FailureCategory(StrEnum):
     AGENT_LOGIC_ERROR = "agent_logic_error"
     TEST_TAMPER_ATTEMPT = "test_tamper_attempt"
     AST_CHEAT_DETECTED = "ast_cheat_detected"
+    TOKEN_BUDGET_EXCEEDED = "token_budget_exceeded"
     MIKADO_PREREQUISITE = "mikado_prerequisite"
     INFRA_OR_FLAKY_ENV = "infra_or_flaky_env"
 
@@ -121,6 +122,7 @@ class TaskNode(BaseModel):
     fencing_token: int = Field(default=0, ge=0)
     active_lease_id: str | None = None
     last_verified_receipt_id: str | None = None
+    derived_from_zwicky_id: str | None = None
     google_task_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -217,6 +219,7 @@ class ZwickyBox(BaseModel):
     max_cost_budget: float | None = None
     selected_configuration: dict[str, str] | None = None
     decision_rationale: str = ""
+    spawned_node_ids: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
 
 class ScopeConfig(BaseModel):

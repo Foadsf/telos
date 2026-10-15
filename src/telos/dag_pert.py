@@ -8,8 +8,10 @@ from typing import Iterable
 
 from telos.models import EdgeRelation, GraphEdge, KanbanState, PertTriplet, TaskNode
 
+
 class CycleDetectedError(ValueError):
     """Raised when adding an edge or merging branches creates a dependency cycle."""
+
 
 @dataclass(frozen=True)
 class CpmNodeSchedule:
@@ -24,6 +26,7 @@ class CpmNodeSchedule:
     total_float: float
     is_critical: bool
 
+
 @dataclass(frozen=True)
 class MonteCarloScheduleResult:
     trials: int
@@ -36,25 +39,59 @@ class MonteCarloScheduleResult:
     p95_tokens: float
     criticality_index: dict[str, float]  # node_id -> probability [0.0..1.0] of being on critical path
 
-class DagEngine:
-    """Pure-Python DAG engine for cycle detection, Mikado leaf discovery, CPM, and Monte Carlo."""
 
-    def __init__(self, nodes: dict[str, TaskNode], edges: Iterable[GraphEdge]) -> None:
-        self.nodes = nodes
+class DagEngine:
+    """
+    Pure-Python DAG engine for cycle detection, Mikado leaf discovery, V-Model hierarchy rollup,
+    cross-scope federation, CPM, and Monte Carlo simulation.
+    """
+
+    def __init__(
+        self,
+        nodes: dict[str, TaskNode],
+        edges: Iterable[GraphEdge],
+        external_nodes: dict[tuple[str, str], TaskNode | None] | None = None,
+    ) -> None:
+        self.nodes = dict(nodes)
         self.edges = list(edges)
-        # Prerequisite map: prereqs[A] = set of B where A DEPENDS_ON B (B must finish before A)
-        self.prereqs: dict[str, set[str]] = {nid: set() for nid in nodes}
-        # Dependents map: dependents[B] = set of A where A DEPENDS_ON B
-        self.dependents: dict[str, set[str]] = {nid: set() for nid in nodes}
+        self.external_nodes = external_nodes or {}
+
+        # Prerequisite map: prereqs[A] = set of local B where A must wait for B to finish
+        self.prereqs: dict[str, set[str]] = {nid: set() for nid in self.nodes}
+        self.dependents: dict[str, set[str]] = {nid: set() for nid in self.nodes}
+        # Structural hierarchy map: children_map[Parent] = set of Child IDs
+        self.children_map: dict[str, set[str]] = {nid: set() for nid in self.nodes}
+        # Federated external blockers: external_prereqs[A] = list of (scope_ref, target_id)
+        self.external_prereqs: dict[str, list[tuple[str, str]]] = {nid: [] for nid in self.nodes}
 
         for edge in self.edges:
-            if edge.relation == EdgeRelation.DEPENDS_ON and not edge.scope_ref:
+            if edge.relation == EdgeRelation.DEPENDS_ON:
+                if edge.scope_ref:
+                    if edge.source_id in self.nodes:
+                        self.external_prereqs[edge.source_id].append((edge.scope_ref, edge.target_id))
+                elif edge.source_id in self.nodes and edge.target_id in self.nodes:
+                    self.prereqs[edge.source_id].add(edge.target_id)
+                    self.dependents[edge.target_id].add(edge.source_id)
+            elif edge.relation == EdgeRelation.CONTAINS and not edge.scope_ref:
                 if edge.source_id in self.nodes and edge.target_id in self.nodes:
+                    self.children_map[edge.source_id].add(edge.target_id)
+                    # Bottom-up V-Model synthesis: a parent node implicitly depends on its children finishing
                     self.prereqs[edge.source_id].add(edge.target_id)
                     self.dependents[edge.target_id].add(edge.source_id)
 
+    def unresolved_external_blockers(self, node_id: str) -> list[str]:
+        """Return human-readable identifiers of any cross-scope prerequisites that are not DONE."""
+        unresolved: list[str] = []
+        for scope_ref, ext_id in self.external_prereqs.get(node_id, []):
+            ext_node = self.external_nodes.get((scope_ref, ext_id))
+            if ext_node is None:
+                unresolved.append(f"{scope_ref}:{ext_id}(UNRESOLVED_EXTERNAL)")
+            elif ext_node.state != KanbanState.DONE:
+                unresolved.append(f"{scope_ref}:{ext_id}({ext_node.state.value})")
+        return unresolved
+
     def validate_acyclic(self) -> list[str]:
-        """Return topological execution order (prerequisites first) or raise CycleDetectedError."""
+        """Return topological execution order (leaves/prerequisites first) or raise CycleDetectedError."""
         in_degree = {nid: len(self.prereqs[nid]) for nid in self.nodes}
         ready = sorted([nid for nid, deg in in_degree.items() if deg == 0])
         topo_order: list[str] = []
@@ -71,31 +108,25 @@ class DagEngine:
         if len(topo_order) != len(self.nodes):
             cycle_nodes = sorted(set(self.nodes.keys()) - set(topo_order))
             raise CycleDetectedError(
-                f"Dependency cycle detected involving nodes: {', '.join(cycle_nodes)}"
+                f"Dependency or hierarchy cycle detected involving nodes: {', '.join(cycle_nodes)}"
             )
         return topo_order
 
     def get_unblocked_mikado_leaves(self, root_id: str | None = None) -> list[TaskNode]:
-        """Return READY or MIKADO_DISCOVERY leaf tasks whose prerequisites are all DONE."""
+        """Return READY, MIKADO_DISCOVERY, or BACKLOG leaf tasks whose local and federated prerequisites are DONE."""
         self.validate_acyclic()
         candidate_ids = set(self.nodes.keys())
 
         if root_id is not None and root_id in self.nodes:
-            # Traverse transitive prerequisites + children of root_id
             visited: set[str] = set()
             stack = [root_id]
-            children_map: dict[str, set[str]] = {nid: set() for nid in self.nodes}
-            for edge in self.edges:
-                if edge.relation == EdgeRelation.CONTAINS and edge.source_id in children_map:
-                    children_map[edge.source_id].add(edge.target_id)
-
             while stack:
                 curr = stack.pop()
                 if curr in visited or curr not in self.nodes:
                     continue
                 visited.add(curr)
                 stack.extend(self.prereqs.get(curr, set()))
-                stack.extend(children_map.get(curr, set()))
+                stack.extend(self.children_map.get(curr, set()))
             candidate_ids = visited
 
         leaves: list[TaskNode] = []
@@ -105,14 +136,21 @@ class DagEngine:
                 continue
             if node.kind.is_right_wing:
                 continue
-            unresolved = [
+            unresolved_local = [
                 pid for pid in self.prereqs[nid]
                 if self.nodes[pid].state != KanbanState.DONE
             ]
-            if not unresolved:
-                leaves.append(node)
+            if unresolved_local or self.unresolved_external_blockers(nid):
+                continue
+            leaves.append(node)
 
-        leaves.sort(key=lambda n: (0 if n.state == KanbanState.READY else 1, n.estimates.duration_minutes.mean, n.id))
+        leaves.sort(
+            key=lambda n: (
+                0 if n.state == KanbanState.READY else 1,
+                n.estimates.duration_minutes.mean,
+                n.id,
+            )
+        )
         return leaves
 
     def compute_cpm(self, include_done: bool = False) -> tuple[dict[str, CpmNodeSchedule], float]:
@@ -132,6 +170,10 @@ class DagEngine:
         for nid in active_order:
             dur = self.nodes[nid].estimates.duration_minutes.mean
             pred_efs = [ef[p] for p in self.prereqs[nid] if p in active_set]
+            for scope_ref, ext_id in self.external_prereqs.get(nid, []):
+                ext_node = self.external_nodes.get((scope_ref, ext_id))
+                if ext_node is not None and (include_done or ext_node.state != KanbanState.DONE):
+                    pred_efs.append(ext_node.estimates.duration_minutes.mean)
             early_s = max(pred_efs) if pred_efs else 0.0
             es[nid] = early_s
             ef[nid] = early_s + dur
@@ -226,6 +268,12 @@ class DagEngine:
                 trial_tokens += t
                 preds = active_prereqs[nid]
                 early_s = max((ef[p] for p in preds), default=0.0)
+                for scope_ref, ext_id in self.external_prereqs.get(nid, []):
+                    ext_node = self.external_nodes.get((scope_ref, ext_id))
+                    if ext_node is not None and (include_done or ext_node.state != KanbanState.DONE):
+                        ext_d = self._sample_beta_pert(ext_node.estimates.duration_minutes, rng)
+                        if ext_d > early_s:
+                            early_s = ext_d
                 es[nid] = early_s
                 ef[nid] = early_s + d
 
