@@ -81,6 +81,17 @@ telos tui          # interactive board
 
 An agent then runs `pulse`, leases the task (`telos_checkout_leaf` over MCP, or `telos checkout <id> --agent <name>`), changes the code, and closes it with `telos_submit_verification` / `telos verify`. Check the outcome in Telos, not in the agent's summary: `telos --format json pulse`, and the receipt in `.telos/ledger/receipts.jsonl`.
 
+## Agent UI integrations
+
+`integrations/` holds native Telos controls for two agent harnesses. They expose only the implementer surface. Contract locking, unquarantine, attest-done and reseal stay in an interactive terminal.
+
+| Harness | Install | What you get |
+|---|---|---|
+| [pi](https://pi.dev) (TUI and `pi -p`) | copy `integrations/pi/telos.ts` to `~/.pi/agent/extensions/`, then `/reload` | the `telos_*` tools as native pi tools (read from `telos-mcp`'s own tool list), a footer status line (`telos: 1 ready \| 0 leased \| 0 quarantined \| 0/2 done`) refreshed after every turn, and `/telos`, `/telos-schedule`, `/telos-next` |
+| [OpenCode](https://opencode.ai) (TUI, web and desktop GUI) | copy `integrations/opencode/commands/*.md` to `~/.config/opencode/commands/` and `integrations/opencode/plugins/telos.js` to `~/.config/opencode/plugins/`; run `telos bootstrap-agents` in the repository for the MCP server | `/telos` (state) and `/telos-next` (lease, fix, verify) in the command menu of every OpenCode client, and a "Telos" status toast in the TUI when a session starts and whenever the agent goes idle |
+
+Each integration does nothing outside a repository that has a `.telos/` directory.
+
 ## Testing
 
 ```bash

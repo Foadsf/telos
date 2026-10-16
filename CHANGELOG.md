@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `integrations/pi/telos.ts`: a pi extension with the Telos implementer tools as native pi tools, a footer status line, and `/telos`, `/telos-schedule` and `/telos-next`.
+- `integrations/opencode/`: `/telos` and `/telos-next` commands for every OpenCode client (TUI, web, desktop), and a server plugin that shows Telos status toasts in the TUI.
+
 ## 0.5.0 — 2026-10-16
 
 First public release.
