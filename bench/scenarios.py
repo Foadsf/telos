@@ -84,6 +84,7 @@ SHOP_TRUTH = {
         "pricing_store": ["tests/test_pricing_store.py"],
     },
     "fixable": ["median", "clamp"],
+    "suite_size": 5,          # test functions in tests/: a pass count below this is not a suite claim
 }
 
 

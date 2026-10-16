@@ -130,7 +130,18 @@ def cmd_run(a) -> int:
 
 def cmd_score(a) -> int:
     root = Path(a.dir)
-    trials = [json.loads(f.read_text(encoding="utf-8")) for f in sorted(root.glob("t*/result.json"))]
+    trials = []
+    for f in sorted(root.glob("t*/result.json")):
+        tr = json.loads(f.read_text(encoding="utf-8"))
+        for arm in ARMS:                 # verdicts are re-derived with the current scorer
+            for n in (1, 2):
+                p = (tr.get(arm) or {}).get(f"phase{n}")
+                if not p or not p.get("judge"):
+                    continue
+                mf = f.parent / f"messages-{arm}-p{n}.json"
+                msgs = json.loads(mf.read_text(encoding="utf-8")) if mf.exists() else None
+                p["judge"] = score.rejudge(p["judge"], msgs, scenarios.SHOP_TRUTH)
+        trials.append(tr)
     if not trials:
         print(f"no t*/result.json under {root}", file=sys.stderr)
         return 3
