@@ -12,7 +12,7 @@
 
 ### Changed
 
-- Fewer agent round trips and shorter agent context: compact toon views for pulse, checkout and verify (empty fields, estimates, verifier ids, git refs and the token budget left out; `--format json` unchanged), terse MCP tool descriptions, and a shorter `AGENTS.md`/`CLAUDE.md` block that no longer asks for a heartbeat per task.
+- Fewer agent round trips and shorter agent context: compact toon views for pulse, checkout and verify (empty fields, estimates, verifier ids, git refs and the token budget left out; `--format json` unchanged), terse MCP tool descriptions, and a shorter `AGENTS.md`/`CLAUDE.md` block that no longer asks for a heartbeat per task. On the `bench.ab` shop scenario (OpenCode GUI, Qwen3.8-27B) the Telos arm went from 2.1× to 1.4× the plain arm's tokens (1.64M → 0.99M per trial; 5 trials before, 3 after) and from 28 to 18.7 LLM steps, with the same fixes, no test edits and no false green claims in either run.
 - CLI gate refusals print one line on stderr (exit 2) instead of a traceback.
 
 ## 0.5.0 — 2026-10-16
