@@ -12,7 +12,7 @@
 
 ### Changed
 
-- Fewer agent round trips and shorter agent context: compact toon views for pulse, checkout and verify (empty fields, estimates, verifier ids, git refs and the token budget left out; `--format json` unchanged), terse MCP tool descriptions, and a shorter `AGENTS.md`/`CLAUDE.md` block that no longer asks for a heartbeat per task. Measured on the bench: see `bench/README.md`.
+- Fewer agent round trips and shorter agent context: compact toon views for pulse, checkout and verify (empty fields, estimates, verifier ids, git refs and the token budget left out; `--format json` unchanged), terse MCP tool descriptions, and a shorter `AGENTS.md`/`CLAUDE.md` block that no longer asks for a heartbeat per task.
 - CLI gate refusals print one line on stderr (exit 2) instead of a traceback.
 
 ## 0.5.0 — 2026-10-16

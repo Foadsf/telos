@@ -816,8 +816,8 @@ class TelosService:
         if own:
             return str(own["task_id"])
         dag = self.build_dag_engine()
-        leaves = [l for l in dag.get_unblocked_mikado_leaves() if not l._integrity_error]
-        for leaf in leaves:
+        # A node failing its seal loads as QUARANTINED, so it is never among the ready leaves.
+        for leaf in dag.get_unblocked_mikado_leaves():
             if self._has_locked_contract(dag, leaf.id):
                 return leaf.id
         reasons = [f"{b['task_id']} ({b['title']}): {b['why']}" for b in self.blocked_tasks(dag)]
