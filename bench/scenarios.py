@@ -26,6 +26,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from bench import backlog, release
+
 DEFAULT_MODEL = "chutes/Qwen/Qwen3.8-27B-TEE"
 
 SHOP_FILES = {
@@ -150,6 +152,54 @@ def make_shop_repo(path: Path, arm: str, model: str = DEFAULT_MODEL) -> dict:
     return info
 
 
+def _lock_contract(svc, node_id: str, title: str, argv: list[str], locked: list[str], scan: list[str]) -> None:
+    """Lock a contract; a flaky test can pass the negative control by luck, so retry until it is red
+    (the command itself stays the plain test run either arm would use)."""
+    from telos.service import VerificationGateError
+    for _ in range(12):
+        try:
+            svc.approve_verification_contract(node_id, title, argv, locked, ast_scan_paths=scan,
+                                              min_tests_collected=1, approved_by="bench-architect")
+            return
+        except VerificationGateError as e:
+            if "Negative control failed" not in str(e):
+                raise
+    raise RuntimeError(f"contract for {node_id} never went red: {argv}")
+
+
+def make_scenario_repo(path: Path, arm: str, scenario: str, model: str = DEFAULT_MODEL) -> dict:
+    """Build `scenario`'s repository for `arm`. Both arms get the same files, commit and model;
+    the telos arm additionally gets the scenario's Telos tasks, contracts and edges."""
+    if scenario == "shop":
+        return make_shop_repo(path, arm, model)
+    if arm not in ("plain", "telos"):
+        raise ValueError(f"arm must be plain or telos, not {arm!r}")
+    mod = SCENARIOS[scenario]["module"]
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=False)
+    _write(path, mod.FILES)
+    baseline = _commit_baseline(path, "baseline")
+    info = {"repo": str(path), "arm": arm, "baseline": baseline, "scenario": scenario}
+    if arm == "telos":
+        from telos.models import EdgeRelation
+        from telos.service import TelosService
+        svc = TelosService(path)
+        svc.init_workspace(scenario)
+        ids = {}
+        for task in mod.TASKS:
+            key, title, test, extra = task if len(task) == 4 else (task[1], task[0], task[1], [])
+            t = svc.create_node(title, concise_spec=f"make {test} pass")
+            _lock_contract(svc, t.id, f"tests: {title}", _pytest_argv(test), [test, *extra],
+                           [*mod.TRUTH["src_dirs"], test])
+            ids[key] = t.id
+        for dep, pre in getattr(mod, "EDGES", []):
+            svc.add_edge(ids[dep], EdgeRelation.DEPENDS_ON, ids[pre])
+        _bootstrap(path)
+        info["tasks"] = ids
+    set_model(path, model)
+    return info
+
+
 DEMO_FILES = {
     "stats.py": (
         '"""Tiny statistics helpers (with two bugs for the demo)."""\n\n\n'
@@ -189,3 +239,11 @@ def make_demo_repo(path: Path) -> dict:
                                           approved_by="demo-architect")
     _bootstrap(path)
     return {"repo": str(path), "baseline": baseline, "A": a.id, "B": b.id, "scenario": "demo"}
+
+
+# name -> how to build and judge it. `shop`'s prompts live in bench.ab (PROMPTS).
+SCENARIOS = {
+    "shop": {"module": None, "truth": SHOP_TRUTH, "phase_timeout": 900},
+    "release": {"module": release, "truth": release.TRUTH, "phase_timeout": 1200},
+    "backlog": {"module": backlog, "truth": backlog.TRUTH, "phase_timeout": 900},
+}
