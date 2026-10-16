@@ -188,9 +188,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def parse_cli(argv: list[str] | None = None) -> tuple[argparse.ArgumentParser, argparse.Namespace]:
+    """
+    Parse argv, treating everything after the first `--` as the verification command.
+    argparse's own handling of `--` after a `nargs="*"` positional differs between Python 3.12 and
+    3.13+, so the split happens here and behaves the same on every supported version.
+    """
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    tail: list[str] = []
+    if "--" in raw:
+        idx = raw.index("--")
+        raw, tail = raw[:idx], raw[idx + 1:]
+    args = parser.parse_args(raw)
+    if tail:
+        if not hasattr(args, "cmd"):
+            parser.error("`--` is only valid with contract-lock, before the verification command")
+        args.cmd = list(args.cmd) + tail
+    return parser, args
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser, args = parse_cli(argv)
     service = TelosService(args.root)
     try:
         return _dispatch(parser, args, service)

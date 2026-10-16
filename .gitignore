@@ -9,3 +9,14 @@ build/
 .pytest_tmp/
 .telos/.cache/
 *.tmp
+
+# Local artifacts of developing Telos with Telos (never published)
+/.telos/
+/AGENTS.md
+/CLAUDE.md
+/.mcp.json
+/opencode.json
+/repomix-output.xml
+/telos_state.json
+/telos-dashboard.html
+.ruff_cache/

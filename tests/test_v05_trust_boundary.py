@@ -135,6 +135,20 @@ def test_attack1_human_cli_lock_needs_interactive_terminal(tmp_path: Path, capsy
     assert "human-only" in capsys.readouterr().err
 
 
+def test_contract_lock_command_after_double_dash_parses_on_every_python() -> None:
+    """Python 3.12 argparse rejected `-- <command>` after a nargs='*' positional; 3.13+ accepted it."""
+    from telos.cli import parse_cli
+
+    _, args = parse_cli([
+        "--root", ".", "contract-lock", "01ABC", "--path", "tests/test_app.py", "--min-tests", "2",
+        "--", "python", "-m", "pytest", "-q", "--maxfail=1", "tests/test_app.py",
+    ])
+    assert args.left_node_id == "01ABC" and args.path == ["tests/test_app.py"] and args.min_tests == 2
+    assert args.cmd == ["python", "-m", "pytest", "-q", "--maxfail=1", "tests/test_app.py"]
+    with pytest.raises(SystemExit):
+        parse_cli(["pulse", "--", "extra"])
+
+
 # ----------------------------------------------------------------------------- attack 2
 def test_attack2_test_that_cannot_fail_is_rejected_at_lock(tmp_path: Path) -> None:
     svc = _workspace(tmp_path)

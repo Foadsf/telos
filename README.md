@@ -1,17 +1,23 @@
-# Telos AI Project Management Harness
+# Telos
 
-**Telos** is a cross-platform, hardware-agnostic, deterministic cognitive exoskeleton and project/task management harness in Python 3.12+ for AI agents (Claude Code, OpenAI ChatGPT/Codex CLI, Google Antigravity, Pi, OpenCode) and human architects.
+**Telos** is a task harness for AI coding agents and the humans who direct them. The rule it enforces: an agent never decides on its own that its work is done. Every task is leased against a test that a human or architect locked *before* the work started. The task closes only when Telos itself runs that test and signs a receipt.
 
-## Key Features
+It also plans: backward (Mikado) decomposition, V-Model traceability, PERT/CPM with Monte Carlo schedules, and Zwicky morphological analysis for design choices. Agents reach it over MCP (Claude Code, OpenCode, Codex and other MCP clients) or through the `telos` CLI (for harnesses without MCP, such as pi). Python 3.12+.
 
-- **Mikado Method Engine (Inverse / Backward Planning):** Discover prerequisite blockers during execution, automatically capture dirty worktree snapshots into isolated refs, and resolve execution bottom-up from unblocked leaves.
-- **V-Model Traceability Matrix ($M:N$):** Strict Left-Wing specifications ($L0 \dots L3$) paired with Right-Wing verification contracts ($R3 \dots R0$). Prevents AI reward hacking via cryptographic hash-locking and AST anti-cheat scans.
-- **Two-Tier PERT / CPM & Monte Carlo Beta-PERT Scheduler:** Deterministic Critical Path Method ($TF=0$) combined with 2,000+ trial Monte Carlo simulation capturing parallel merge bias ($P_{50}, P_{80}, P_{95}$ duration and token distributions).
-- **Zwicky Morphological Analysis & Cross-Consistency Assessment (CCA):** Formal multi-dimensional design space exploration with 4-state compatibility matrices (`unassessed`, `incompatible`, `neutral`, `synergistic`) and cost budgeting.
-- **Fencing Tokens & 3-Strike Circuit Breaker:** Monotonically increasing lease generations preventing stale agent clobbering, with automated quarantine on repeated failures or tampering attempts. Quarantine is released only by a human (see Trust Model).
-- **Git-Merge-Friendly Persistence:** Authoritative state stored as per-node canonical `.toml` files and append-only `.jsonl` ledgers. Ephemeral SQLite WAL query cache in `.telos/.cache/index.sqlite`.
-- **Multi-Modal Interfaces:** Frugal Model Context Protocol (MCP) server for agents (`telos_pulse`, `telos_checkout_leaf`, `telos_mikado_discover`, `telos_submit_verification`, `telos_schedule_pert`, `telos_zwicky_solve`, `telos_decompose`), unified Typer/Rich CLI, and reactive keyboard-driven Textual TUI.
-- **Google Tasks Projection:** Scoped two-way projection with verification gate safety (mobile checkboxes cannot bypass V-Model verification contracts).
+**Status:** alpha (0.5.0). Tested on Windows 11 (Python 3.14) and Ubuntu 24.04 (Python 3.12). Read the Trust Model below before relying on it.
+
+## What it does
+
+- **Locked, failing tests before any work.** A contract (test command plus SHA-256 digests of the test files) is locked before a task can be leased. The command must fail on the current tree, so a test that cannot fail is rejected.
+- **Verification Telos runs itself.** `verify` re-checks the locked digests and the test harness surface, scans for skip/exit tricks, runs the command in a scrubbed environment, reads pytest's JUnit report, and signs a receipt. Non-pytest commands fall back to the exit code and printed counts, which is weaker evidence.
+- **Leases with fencing tokens and a 3-strike circuit breaker.** Stale agents cannot overwrite newer work. Repeated failures or tampering quarantine the task, and only a human releases it.
+- **Mikado method.** When an agent hits a missing prerequisite, it records it. Telos snapshots the attempt into a git ref and blocks the task on the new prerequisite.
+- **V-Model traceability.** Left-wing nodes (L0 requirement to L3 implementation) are verified by right-wing nodes (R3 unit to R0 acceptance). A parent closes only after its children.
+- **PERT/CPM and Monte Carlo.** Deterministic critical path plus Beta-PERT simulation (P50/P80/P95 duration and token cost, criticality index). Parallel execution waves for several agents.
+- **Zwicky morphological analysis.** Design dimensions, pairwise cross-consistency (`unassessed`, `incompatible`, `neutral`, `synergistic`), ranked conflict-free configurations, and committed decisions that spawn traced tasks.
+- **Git-friendly state.** One canonical `.toml` file per node plus append-only `.jsonl` ledgers in `.telos/`. A SQLite index and the active leases live in `.telos/.cache/`, which is not committed; deleting it revokes open leases.
+- **Interfaces.** MCP server (stdio or Streamable HTTP), argparse CLI with `rich`/`json`/`toon` output, a Textual TUI, and a static HTML dashboard.
+- **Google Tasks projection (experimental).** Push and reconcile only. A completed checkbox can never close a task that has a verification gate. Push has not been tested against the live API.
 
 ## Trust Model (v0.5)
 
@@ -36,49 +42,53 @@ The agent being verified must not be able to open its own gates. Telos enforces 
 
 Upgrading a v0.4 workspace: review it, then run `telos reseal --rationale "..."` once. Unverifiable DONE tasks are kept DONE through an explicit `reseal-done` attestation, and open leases are revoked.
 
+Report security problems as described in [SECURITY.md](SECURITY.md).
+
 ## Installation
 
-```bash
-uv venv
-# On Windows:
-.venv\Scripts\activate
-# On Linux/macOS:
-source .venv/bin/activate
+As a tool, which puts `telos` and `telos-mcp` on PATH:
 
-uv pip install -e ".[dev]"
+```bash
+uv tool install git+https://github.com/Foadsf/telos
+```
+
+For development:
+
+```bash
+git clone https://github.com/Foadsf/telos && cd telos
+uv venv && uv pip install -e ".[dev]"
+pytest
 ```
 
 ## Quickstart
 
 ```bash
-# Initialize a workspace
 telos init --name "MyProject"
 
 # Add a task
-telos add "Design System Architecture" --kind L1_architecture --opt-min 20 --likely-min 45 --pess-min 90
+telos add "Fix the median helper" --spec "tests/test_stats.py passes"
 
 # Human architect: lock a test that FAILS today, before any agent leases the task
-telos contract-lock <task_id> --path tests/test_feature.py -- python -m pytest tests/test_feature.py
+telos contract-lock <task_id> --path tests/test_stats.py -- python -m pytest -q tests/test_stats.py
 
-# View agent radar
-telos pulse
+# Register Telos for agents in this repo (merges .mcp.json, opencode.json and an AGENTS.md/CLAUDE.md block)
+telos bootstrap-agents
 
-# Run CPM and Monte Carlo schedule analysis
-telos schedule
-
-# Launch interactive Textual TUI
-telos tui
-
-# Run MCP stdio server (implementer surface; add --role architect for a separate architect agent)
-telos mcp
+telos pulse        # what is ready, leased, quarantined
+telos schedule     # CPM and Monte Carlo
+telos tui          # interactive board
 ```
+
+An agent then runs `pulse`, leases the task (`telos_checkout_leaf` over MCP, or `telos checkout <id> --agent <name>`), changes the code, and closes it with `telos_submit_verification` / `telos verify`. Check the outcome in Telos, not in the agent's summary: `telos --format json pulse`, and the receipt in `.telos/ledger/receipts.jsonl`.
 
 ## Testing
 
 ```bash
-pytest -v
+pytest
 ```
+
+The suite replays known bypasses (self-locked contracts, tests that cannot fail, rigged conftest/pytest/environment, edited state files, forged receipts, self-release from quarantine) and checks that each fails closed.
 
 ## License
 
-Apache-2.0
+Apache-2.0. See [LICENSE](LICENSE).

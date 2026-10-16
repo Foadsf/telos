@@ -6,10 +6,24 @@ build-backend = "hatchling.build"
 [project]
 name = "telos-harness"
 version = "0.5.0"
-description = "Deterministic Cognitive Exoskeleton & Project Management Harness for AI Agents"
+description = "Task harness for AI agents: work closes only when Telos runs a locked, failing-first test and signs a receipt"
 readme = "README.md"
 license = { text = "Apache-2.0" }
+authors = [{ name = "Foad S. Farimani" }]
 requires-python = ">=3.12"
+keywords = ["ai-agents", "mcp", "reward-hacking", "verification", "mikado", "pert", "v-model", "zwicky"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+]
 dependencies = [
     "pydantic>=2.6.0",
     "rich>=13.7.0",
@@ -17,8 +31,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.2.0"]
 dev = ["pytest>=8.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/Foadsf/telos"
+Issues = "https://github.com/Foadsf/telos/issues"
+Changelog = "https://github.com/Foadsf/telos/blob/master/CHANGELOG.md"
 
 [project.scripts]
 telos = "telos.cli:main"

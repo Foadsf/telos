@@ -13,7 +13,7 @@ import sys
 import pytest
 
 from telos.mcp_server import TelosMcpDispatcher
-from telos.models import EdgeRelation, KanbanState, NodeKind
+from telos.models import KanbanState
 from telos.service import TelosService, VerificationGateError
 from telos.web_gui import export_dashboard_file
 

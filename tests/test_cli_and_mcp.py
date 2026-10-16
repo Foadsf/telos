@@ -6,12 +6,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import sys
 import pytest
 
 from telos.cli import main as cli_main
 from telos.mcp_server import TelosMcpDispatcher
-from telos.models import KanbanState, NodeKind, PertTriplet, ZwickyBox, ZwickyOption, ZwickyPairAssessment, ZwickyCompatibility
+from telos.models import ZwickyBox, ZwickyOption
 from telos.service import TelosService
 from telos.ulid import new_ulid
 from tests.conftest import lock_failing_gate

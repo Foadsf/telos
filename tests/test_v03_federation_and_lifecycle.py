@@ -7,7 +7,6 @@ unquarantine workflow, Zwicky ADR task promotion, and MCP JSON-RPC protocol hand
 from __future__ import annotations
 
 from pathlib import Path
-import sys
 import pytest
 
 from telos.mcp_server import TelosMcpDispatcher
