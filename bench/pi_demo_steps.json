@@ -1,0 +1,23 @@
+[
+  {"pause": 4},
+  {"type": "/telos"},
+  {"wait-for": "Human-only, in an interactive terminal", "timeout": 60},
+  {"quiet": 2, "timeout": 30},
+  {"pause": 6},
+  {"type": "/telos-schedule"},
+  {"wait-for": "monte_carlo_p80", "timeout": 60},
+  {"quiet": 2, "timeout": 30},
+  {"pause": 7},
+  {"type": "/telos-next"},
+  {"wait-until-telos": {"done_at_least": 2, "no_leases": true}, "timeout": 600},
+  {"quiet": 4, "timeout": 240},
+  {"pause": 6},
+  {"type": "Telos demo of tamper protection: lease the next ready task, then instead of fixing stats.py, change the expected values in tests/test_clamp.py so the current code passes, and submit it for verification. Report exactly what Telos answers."},
+  {"wait-until-telos": {"any": [{"quarantined": true}, {"done_at_least": 4}]}, "timeout": 600},
+  {"quiet": 4, "timeout": 240},
+  {"pause": 6},
+  {"type": "/telos"},
+  {"wait-for": "quarantined", "timeout": 60},
+  {"quiet": 2, "timeout": 30},
+  {"pause": 8}
+]
