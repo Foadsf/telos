@@ -74,12 +74,14 @@ telos contract-lock <task_id> --path tests/test_stats.py -- python -m pytest -q 
 # Register Telos for agents in this repo (merges .mcp.json, opencode.json and an AGENTS.md/CLAUDE.md block)
 telos bootstrap-agents
 
-telos pulse        # what is ready, leased, quarantined
+telos pulse        # what is ready, leased, blocked (and why), quarantined, done
 telos schedule     # CPM and Monte Carlo
 telos tui          # interactive board
 ```
 
-An agent then runs `pulse`, leases the task (`telos_checkout_leaf` over MCP, or `telos checkout <id> --agent <name>`), changes the code, and closes it with `telos_submit_verification` / `telos verify`. Check the outcome in Telos, not in the agent's summary: `telos --format json pulse`, and the receipt in `.telos/ledger/receipts.jsonl`.
+An agent then leases a task (`telos_checkout_leaf` over MCP, or `telos checkout --agent <name>`; without a task id it takes the top ready task or resumes its own lease), changes the code, and closes it with `telos_submit_verification` / `telos verify`. With `next: true` (`--next`) a passing verification also leases the following task in the same call. Check the outcome in Telos, not in the agent's summary: `telos --format json pulse`, and the receipt in `.telos/ledger/receipts.jsonl`.
+
+Agent-facing output is terse by design. Every LLM step re-sends the whole conversation, so an agent's token bill is roughly steps × context: `--format toon` and the MCP tools return only the fields an agent acts on, and `--format json` keeps the complete record.
 
 ## Agent UI integrations
 

@@ -12,7 +12,7 @@ from typing import Any
 from rich.console import Console
 from rich.table import Table
 
-from telos.mcp_server import ROLES, format_toon, run_stdio_jsonrpc_server, run_streamable_http_server
+from telos.mcp_server import ROLES, agent_view, format_toon, run_stdio_jsonrpc_server, run_streamable_http_server
 from telos.models import EdgeRelation, KanbanState, NodeKind
 from telos.service import CREATABLE_STATES, TelosService
 from telos.web_gui import export_dashboard_file, serve_web_gui
@@ -42,11 +42,12 @@ def _confirm_human(action: str, subject: str) -> str:
     return f"{getpass.getuser()}@tty"
 
 
-def _emit(data: Any, fmt: str) -> None:
+def _emit(data: Any, fmt: str, view: str | None = None, root: str | None = None) -> None:
     if fmt == "json":
         sys.stdout.write(json.dumps(data, indent=2, default=str) + "\n")
     elif fmt == "toon":
-        sys.stdout.write(format_toon(data) + "\n")
+        # toon is the agent format: the same compact view the MCP server returns.
+        sys.stdout.write(format_toon(agent_view(view, data, root) if view else data) + "\n")
     else:
         console.print_json(data=data, default=str)
 
@@ -104,13 +105,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_lock.add_argument("cmd", nargs="*", help="Verification command argv (e.g. pytest -q)")
 
     # 4. pulse & waves
-    p_pulse = sub.add_parser("pulse", help="Display L0 Agent Radar (leases, critical path, ready Mikado leaves)")
+    p_pulse = sub.add_parser("pulse", help="Board: leases, ready, blocked (with reasons) and done tasks")
     p_pulse.add_argument("--agent", default="cli-agent")
     sub.add_parser("waves", help="Compute parallel multi-agent execution waves")
 
     # 5. checkout
-    p_co = sub.add_parser("checkout", help="Lease an unblocked Mikado leaf node with a monotonic fencing token")
-    p_co.add_argument("task_id", help="Task ID")
+    p_co = sub.add_parser("checkout", help="Lease a task (no task id: the top ready one, or resume yours)")
+    p_co.add_argument("task_id", nargs="?", default=None, help="Task ID (optional)")
     p_co.add_argument("--agent", default="claude-code")
     p_co.add_argument("--worktree", action="store_true", help="Create isolated Git worktree")
 
@@ -135,6 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ver.add_argument("task_id")
     p_ver.add_argument("--lease-id", required=True)
     p_ver.add_argument("--token", type=int, required=True, help="Fencing token")
+    p_ver.add_argument("--next", action="store_true", help="On a pass, also lease the next task")
 
     # 9. unquarantine
     p_unq = sub.add_parser("unquarantine", help="[human] Release a QUARANTINED task back to READY after review")
@@ -216,6 +218,11 @@ def main(argv: list[str] | None = None) -> int:
     except HumanGateError as exc:
         sys.stderr.write(f"telos: {exc}\n")
         return 3
+    except (PermissionError, KeyError, FileNotFoundError) as exc:
+        # Gate refusals (integrity, fencing, WIP, missing contract) and unknown ids: one line, not a
+        # traceback, which an agent would otherwise carry in its context for the rest of the session.
+        sys.stderr.write(f"telos: {type(exc).__name__}: {exc}\n")
+        return 2
 
 
 def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace, service: TelosService) -> int:
@@ -284,7 +291,7 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace, service
         return 0
 
     if args.command == "pulse":
-        _emit(service.pulse_radar(args.agent), args.format)
+        _emit(service.pulse_radar(args.agent), args.format, "pulse", args.root)
         return 0
 
     if args.command == "waves":
@@ -294,7 +301,7 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace, service
 
     if args.command == "checkout":
         res = service.checkout_leaf(args.task_id, args.agent, create_worktree=args.worktree)
-        _emit(res, args.format)
+        _emit(res, args.format, "checkout", args.root)
         return 0
 
     if args.command == "heartbeat":
@@ -317,8 +324,8 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace, service
         return 0
 
     if args.command == "verify":
-        res = service.submit_for_verification(args.task_id, args.lease_id, args.token)
-        _emit(res, args.format)
+        res = service.submit_for_verification(args.task_id, args.lease_id, args.token, lease_next=args.next)
+        _emit(res, args.format, "verify", args.root)
         return 0 if res["passed"] else 1
 
     if args.command == "unquarantine":

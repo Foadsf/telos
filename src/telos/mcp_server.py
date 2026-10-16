@@ -24,28 +24,110 @@ ROLES = ("implementer", "architect")
 ARCHITECT_ONLY_TOOLS = {"telos_contract_lock"}
 
 
+def _empty(v: Any) -> bool:
+    return v is None or v == "" or (isinstance(v, (dict, list)) and not v)
+
+
 def format_toon(data: Any, indent: int = 0) -> str:
-    """Compact Token-Oriented Object Notation (TOON/YAML-lite) serializer to minimize LLM context usage."""
+    """
+    Compact Token-Oriented Object Notation (TOON/YAML-lite) serializer to minimize LLM context usage.
+    Empty values (None, "", [], {}) are left out: every step re-sends the whole context, so a blank
+    field costs tokens on every later turn. `--format json` keeps the complete record.
+    """
     pad = "  " * indent
     if isinstance(data, dict):
         lines: list[str] = []
         for k, v in data.items():
-            if isinstance(v, (dict, list)) and v:
+            if _empty(v):
+                continue
+            if isinstance(v, (dict, list)):
                 lines.append(f"{pad}{k}:")
                 lines.append(format_toon(v, indent + 1))
             else:
-                lines.append(f"{pad}{k}: {json.dumps(v) if isinstance(v, list) else v}")
+                lines.append(f"{pad}{k}: {v}")
         return "\n".join(lines)
     if isinstance(data, list):
         lines = []
         for item in data:
             if isinstance(item, dict):
-                compact = " | ".join(f"{k}={v}" for k, v in item.items())
+                compact = " | ".join(f"{k}={v}" for k, v in item.items() if not _empty(v))
                 lines.append(f"{pad}- {compact}")
             else:
                 lines.append(f"{pad}- {item}")
         return "\n".join(lines)
     return f"{pad}{data}"
+
+
+def _clip(text: str, limit: int) -> str:
+    """Keep the tail: a test runner's verdict and failing ids are at the end of its output."""
+    return text if len(text) <= limit else "..." + text[-limit:]
+
+
+def agent_view(command: str, res: Any, root: Path | str | None = None) -> Any:
+    """
+    What an agent sees of pulse/checkout/verify in toon: the fields it acts on, nothing it never uses
+    (estimates, float, verifier ids, git refs, token budget). The service result itself is unchanged
+    and stays complete in `--format json`; gates and state transitions do not depend on this view.
+    """
+    if not isinstance(res, dict):
+        return res
+    if command == "pulse":
+        counts = res.get("counts") or {}
+        return {
+            "active_leases": [
+                {k: l.get(k) for k in ("task_id", "title", "lease_id", "fencing_token", "strikes", "last_failure")}
+                for l in res.get("active_leases", [])
+            ],
+            "ready": [
+                {"task_id": l["task_id"], "title": l["title"]}
+                for l in res.get("ready_mikado_leaves", []) if l.get("contract", True)
+            ],
+            "blocked_tasks": [
+                {"task_id": b["task_id"], "title": b["title"], "why": b["why"]} for b in res.get("blocked_tasks", [])
+            ],
+            "done_tasks": res.get("done_tasks"),
+            "quarantined_tasks": res.get("quarantined_tasks"),
+            "integrity_violations": res.get("integrity_violations"),
+            "sub_projects": res.get("sub_projects"),
+            "counts": f"{counts.get('tasks_done', counts.get('done'))}/{counts.get('tasks_total', counts.get('total'))} tasks done",
+        }
+    if command == "checkout":
+        if "none" in res:
+            return res
+        same_tree = root is not None and Path(str(res.get("worktree_path", ""))).resolve() == Path(root).resolve()
+        strikes = str(res.get("strikes", ""))
+        return {
+            "task_id": res.get("task_id"),
+            "title": res.get("title"),
+            "spec": res.get("spec"),
+            "lease_id": res.get("lease_id"),
+            "fencing_token": res.get("fencing_token"),
+            "strikes": None if strikes.startswith("0/") else strikes,
+            "worktree_path": None if same_tree else res.get("worktree_path"),
+            "locked_tests": [
+                {"cmd": g.get("cmd"), "locked_paths": g.get("locked_paths")} for g in res.get("verification_gates", [])
+            ],
+            "episodic_memory_do_not_repeat": [
+                {"category": a.get("category"), "rationale": _clip(str(a.get("rationale", "")), 300)}
+                for a in res.get("episodic_memory_do_not_repeat", [])
+            ],
+        }
+    if command == "verify":
+        if res.get("passed"):
+            view: dict[str, Any] = {
+                "passed": True,
+                "task_id": res.get("task_id"),
+                "state": res.get("state"),
+                "receipt_ids": res.get("receipt_ids"),
+                "newly_ready_tasks": res.get("newly_ready_tasks"),
+            }
+        else:
+            view = {k: res.get(k) for k in ("passed", "task_id", "state", "failure_category", "strikes", "receipt_id")}
+            view["diagnostic"] = _clip(str(res.get("diagnostic", "")), 1500)
+        if "next" in res:
+            view["next"] = agent_view("checkout", res["next"], root)
+        return view
+    return res
 
 
 class TelosMcpDispatcher:
@@ -67,7 +149,7 @@ class TelosMcpDispatcher:
         return [
             {
                 "name": "telos_pulse",
-                "description": "Return L0 Radar (~120 tokens): active leases, critical path duration, federated sub-projects, and top ready Mikado leaves.",
+                "description": "Board: leases, ready tasks, blocked tasks with reasons, done tasks.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {"agent_id": {"type": "string"}},
@@ -75,12 +157,12 @@ class TelosMcpDispatcher:
             },
             {
                 "name": "telos_waves",
-                "description": "Return collision-free parallel execution waves for multi-agent dispatch.",
+                "description": "Parallel execution waves for multi-agent dispatch.",
                 "inputSchema": {"type": "object", "properties": {}},
             },
             {
                 "name": "telos_checkout_leaf",
-                "description": "Lease an unblocked Mikado leaf node with a monotonic fencing_token and retrieve L1 Context Capsule + failure history.",
+                "description": "Lease a task (no task_id: the top ready one, or resume yours). Returns spec, locked tests, lease_id, fencing_token, failed attempts.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -88,7 +170,7 @@ class TelosMcpDispatcher:
                         "agent_id": {"type": "string"},
                         "create_worktree": {"type": "boolean", "default": False},
                     },
-                    "required": ["task_id", "agent_id"],
+                    "required": ["agent_id"],
                 },
             },
             {
@@ -109,7 +191,7 @@ class TelosMcpDispatcher:
             },
             {
                 "name": "telos_heartbeat",
-                "description": "Extend active lease TTL and record token consumption; trips circuit breaker if pessimistic token budget is exceeded.",
+                "description": "Optional: extend a lease past its 30-min TTL and record tokens used (over budget quarantines the task).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -123,7 +205,7 @@ class TelosMcpDispatcher:
             },
             {
                 "name": "telos_mikado_discover",
-                "description": "Record a discovered prerequisite blocker, snapshot/reset dirty state without git stash, link dependency, and checkout the new leaf.",
+                "description": "Record a missing prerequisite of your leased task: snapshots and resets your changes and links a new prerequisite task (it needs a locked contract before it can be leased).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -145,20 +227,21 @@ class TelosMcpDispatcher:
             },
             {
                 "name": "telos_submit_verification",
-                "description": "Run the zero-trust V-Model verification gate (child completion check, SHA-256 test digest check, AST anti-skip scan, subprocess test runner) to close a leased task.",
+                "description": "Run the verification gate on your leased task (locked-test digests, anti-skip scan, test run). next=true: on a pass, also lease the next task.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "task_id": {"type": "string"},
                         "lease_id": {"type": "string"},
                         "fencing_token": {"type": "integer"},
+                        "next": {"type": "boolean", "default": False},
                     },
                     "required": ["task_id", "lease_id", "fencing_token"],
                 },
             },
             {
                 "name": "telos_schedule_pert",
-                "description": "Run deterministic CPM and Monte Carlo Beta-PERT simulation (P50/P80/P95 duration & tokens + Criticality Index).",
+                "description": "CPM and Monte Carlo PERT schedule (P50/P80/P95, criticality).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {"trials": {"type": "integer", "default": 2000}},
@@ -166,7 +249,7 @@ class TelosMcpDispatcher:
             },
             {
                 "name": "telos_zwicky_create",
-                "description": "Create a Zwicky Morphological Box with dimensions, options, and pairwise Cross-Consistency Assessments.",
+                "description": "Create a Zwicky morphological box (dimensions, options, pairwise consistency).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -181,7 +264,7 @@ class TelosMcpDispatcher:
             },
             {
                 "name": "telos_zwicky_solve",
-                "description": "Solve a Zwicky Morphological Box using Cross-Consistency Assessment to rank conflict-free architectures.",
+                "description": "Rank the consistent configurations of a Zwicky box.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -193,7 +276,7 @@ class TelosMcpDispatcher:
             },
             {
                 "name": "telos_zwicky_commit",
-                "description": "Commit a winning Zwicky Morphological configuration as an ADR and automatically spawn L1/L2 tasks linked via DERIVED_FROM.",
+                "description": "Commit a Zwicky configuration as an ADR and spawn its tasks.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -207,7 +290,7 @@ class TelosMcpDispatcher:
             },
             {
                 "name": "telos_decompose",
-                "description": "Create a new task node and optionally attach it under a parent or prerequisite (supports cross-scope `scope_ref`).",
+                "description": "Create a task, optionally under a parent or after a prerequisite (depends_on_scope_ref: another scope).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -234,19 +317,20 @@ class TelosMcpDispatcher:
                 f"reseal are human-only."
             )
         try:
+            root = self.service.root
             if name == "telos_pulse":
                 res = self.service.pulse_radar(arguments.get("agent_id"))
-                return format_toon(res)
+                return format_toon(agent_view("pulse", res, root))
             if name == "telos_waves":
                 waves = self.service.compute_parallel_waves()
                 return format_toon({"waves": [{"wave": idx, "tasks": w} for idx, w in enumerate(waves)]})
             if name == "telos_checkout_leaf":
                 res = self.service.checkout_leaf(
-                    task_id=arguments["task_id"],
+                    task_id=arguments.get("task_id") or None,
                     agent_id=arguments["agent_id"],
                     create_worktree=bool(arguments.get("create_worktree", False)),
                 )
-                return format_toon(res)
+                return format_toon(agent_view("checkout", res, root))
             if name == "telos_contract_lock":
                 l_node, r_node = self.service.approve_verification_contract(
                     left_node_id=arguments["left_node_id"],
@@ -287,8 +371,9 @@ class TelosMcpDispatcher:
                     task_id=arguments["task_id"],
                     lease_id=arguments["lease_id"],
                     fencing_token=int(arguments["fencing_token"]),
+                    lease_next=str(arguments.get("next", False)).lower() in ("true", "1"),
                 )
-                return format_toon(res)
+                return format_toon(agent_view("verify", res, root))
             if name == "telos_schedule_pert":
                 cpm, mc = self.service.compute_schedule(trials=int(arguments.get("trials", 2000)))
                 return format_toon(

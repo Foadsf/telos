@@ -108,11 +108,12 @@ async function pulseJson(root: string): Promise<any | null> {
 
 function statusLine(p: any | null): string {
   if (!p) return "telos: unreadable (run `telos pulse` in a terminal)";
-  const ready = (p.ready_mikado_leaves || []).length;
+  const ready = (p.ready_mikado_leaves || []).filter((l: any) => l.contract !== false).length;
   const leased = (p.active_leases || []).length;
   const quarantined = (p.quarantined_tasks || []).length;
   const integrity = Object.keys(p.integrity_violations || {}).length;
-  const done = p.counts ? `${p.counts.done}/${p.counts.total} done` : "";
+  const c = p.counts;
+  const done = c ? `${c.tasks_done ?? c.done}/${c.tasks_total ?? c.total} done` : "";
   const parts = [`${ready} ready`, `${leased} leased`, `${quarantined} quarantined`];
   if (integrity) parts.push(`${integrity} INTEGRITY VIOLATION${integrity > 1 ? "S" : ""}`);
   if (done) parts.push(done);
@@ -122,12 +123,13 @@ function statusLine(p: any | null): string {
 function describePulse(p: any | null): string {
   if (!p) return "Telos state could not be read. Run `telos pulse` in a terminal to see the error.";
   const out: string[] = ["## Telos", statusLine(p), ""];
-  for (const l of p.ready_mikado_leaves || []) {
+  for (const l of (p.ready_mikado_leaves || []).filter((x: any) => x.contract !== false)) {
     out.push(`- ready  ${l.task_id}  ${l.title}  (~${l.est_min} min${l.critical ? ", critical" : ""})`);
   }
   for (const l of p.active_leases || []) {
     out.push(`- leased ${l.task_id}  ${l.title}  token ${l.fencing_token}, strikes ${l.strikes}`);
   }
+  for (const b of p.blocked_tasks || []) out.push(`- blocked ${b.task_id}  ${b.title}: ${b.why}`);
   for (const q of p.quarantined_tasks || []) out.push(`- quarantined ${q}  (a human runs \`telos unquarantine\`)`);
   for (const [id, why] of Object.entries(p.integrity_violations || {})) out.push(`- INTEGRITY ${id}: ${why}`);
   out.push("", "Human-only, in an interactive terminal: `telos contract-lock`, `telos unquarantine`, `telos attest-done`, `telos reseal`.");
@@ -175,7 +177,7 @@ export default function (pi: ExtensionAPI) {
           description: "Return the rules for working in this Telos repository.",
           promptSnippet: "Rules for working in a Telos-managed repository",
           promptGuidelines: [
-            "This repository is managed by Telos: start with telos_pulse, lease a task with telos_checkout_leaf, change only the code under test, and close it with telos_submit_verification. Never edit .telos/, locked tests, conftest.py or pytest configuration.",
+            "This repository is managed by Telos: lease a task with telos_checkout_leaf (no task_id = the top ready one), change only the code under test, and close it with telos_submit_verification (next: true leases the following task in the same call). Never edit .telos/, locked tests, conftest.py or pytest configuration. telos_pulse shows what is blocked and why.",
           ],
           parameters: Type.Object({}),
           async execute() {
@@ -229,9 +231,9 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const text =
-        "Work the next Telos task: call telos_pulse, lease the top ready task with telos_checkout_leaf, " +
-        "change only the code under test, and close it with telos_submit_verification. Report the state and " +
-        "receipt Telos returns. If nothing can be leased, say why and stop." + (args ? `\nFocus: ${args}` : "");
+        "Work the next Telos task: lease it with telos_checkout_leaf (no task_id), change only the code under " +
+        "test, and close it with telos_submit_verification. Report the state and receipt Telos returns. If " +
+        "nothing can be leased, say why and stop." + (args ? `\nFocus: ${args}` : "");
       if (ctx.isIdle()) pi.sendUserMessage(text);
       else pi.sendUserMessage(text, { deliverAs: "followUp" });
     },

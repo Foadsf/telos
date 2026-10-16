@@ -793,9 +793,70 @@ class TelosService:
             resealed.append(node.id)
         return {"resealed_nodes": len(resealed), "done_attested_on_reseal": attested_done, "key": str(self.keyring.key_path)}
 
+    def _has_locked_contract(self, dag: DagEngine, node_id: str) -> bool:
+        return any(
+            dag.nodes[e.source_id].contract is not None
+            for e in dag.edges
+            if e.relation == EdgeRelation.VERIFIES and e.target_id == node_id and e.source_id in dag.nodes
+        )
+
+    def pick_leaf(self, agent_id: str) -> str:
+        """
+        The task a `checkout` without a task id leases: this agent's own active lease if it holds one
+        (resuming interrupted work), else the top ready leaf that has a locked contract. Picking only
+        chooses; every gate still runs in `checkout_leaf`. Raises with the reason when nothing is leasable.
+        """
+        self.expire_stale_leases()
+        self._auto_ready_dependents()
+        with self._connect_sqlite() as conn:
+            own = conn.execute(
+                "SELECT task_id FROM active_leases WHERE active = 1 AND agent_id = ? ORDER BY acquired_at",
+                (agent_id,),
+            ).fetchone()
+        if own:
+            return str(own["task_id"])
+        dag = self.build_dag_engine()
+        leaves = [l for l in dag.get_unblocked_mikado_leaves() if not l._integrity_error]
+        for leaf in leaves:
+            if self._has_locked_contract(dag, leaf.id):
+                return leaf.id
+        reasons = [f"{b['task_id']} ({b['title']}): {b['why']}" for b in self.blocked_tasks(dag)]
+        with self._connect_sqlite() as conn:
+            reasons += [
+                f"{r['task_id']}: leased by {r['agent_id']}"
+                for r in conn.execute("SELECT task_id, agent_id FROM active_leases WHERE active = 1").fetchall()
+            ]
+        raise VerificationGateError(f"No leasable task. {'; '.join(reasons) or 'No open tasks.'}")
+
+    def blocked_tasks(self, dag: DagEngine | None = None) -> list[dict[str, str]]:
+        """Open work tasks nobody can lease right now, each with the reason, so agents need not read `.telos/`."""
+        dag = dag or self.build_dag_engine()
+        out: list[dict[str, str]] = []
+        for nid in sorted(dag.nodes):
+            node = dag.nodes[nid]
+            if node.kind.is_right_wing or node.state in (KanbanState.DONE, KanbanState.LEASED, KanbanState.VERIFYING):
+                continue
+            waits = [p for p in dag.prereqs.get(nid, set()) if dag.nodes[p].state != KanbanState.DONE]
+            waits += dag.unresolved_external_blockers(nid)
+            if node._integrity_error:
+                why = f"seal violation ({node._integrity_error}); a human reviews and runs `telos unquarantine`"
+            elif node.state == KanbanState.QUARANTINED:
+                why = f"quarantined at {node.strike_count}/{node.max_strikes} strikes; human-only `telos unquarantine`"
+            elif waits:
+                why = "waits on " + ", ".join(sorted(waits))
+            elif not self._has_locked_contract(dag, nid):
+                why = "awaiting a locked contract (human/architect only)"
+            else:
+                continue
+            last = self.get_attempts_for_task(nid)[-1:]
+            if last:
+                why += f"; last attempt {last[0].category.value}: {last[0].rationale[:160]}"
+            out.append({"task_id": nid, "title": node.title, "state": node.state.value, "why": why})
+        return out
+
     def checkout_leaf(
         self,
-        task_id: str,
+        task_id: str | None,
         agent_id: str,
         ttl_minutes: int = 30,
         create_worktree: bool = False,
@@ -805,7 +866,10 @@ class TelosService:
         Acquire an exclusive lease with a monotonically incremented fencing_token.
         Enforces Agile Kanban WIP limits (`max_wip_per_agent` and `max_wip_total`),
         local prerequisites/children, and federated cross-scope prerequisites.
+        Without a task_id it leases `pick_leaf(agent_id)`, through the same gates.
         """
+        if not task_id:
+            task_id = self.pick_leaf(agent_id)
         self.expire_stale_leases()
         node = self.get_node(task_id)
         if node._integrity_error:
@@ -1014,6 +1078,24 @@ class TelosService:
     # Zero-Trust Verification Gate, Worktree Harvest & 3-Strike Breaker
     # -------------------------------------------------------------------------
     def submit_for_verification(
+        self, task_id: str, lease_id: str, fencing_token: int, lease_next: bool = False
+    ) -> dict[str, Any]:
+        """
+        Run the gate. With `lease_next`, a PASS also leases the next task for the same agent through
+        `checkout_leaf` (all its gates apply) and returns that capsule under `next`, saving the agent a
+        separate checkout round trip. A failed verification never leases anything.
+        """
+        res = self._submit_for_verification(task_id, lease_id, fencing_token)
+        if lease_next and res["passed"]:
+            agent_id = res.pop("_agent_id")
+            try:
+                res["next"] = self.checkout_leaf(None, agent_id)
+            except (VerificationGateError, IntegrityError) as exc:
+                res["next"] = {"none": str(exc)}
+        res.pop("_agent_id", None)
+        return res
+
+    def _submit_for_verification(
         self, task_id: str, lease_id: str, fencing_token: int
     ) -> dict[str, Any]:
         node = self.get_node(task_id)
@@ -1149,6 +1231,7 @@ class TelosService:
             "receipt_ids": all_receipts,
             "verified_git_ref": verified_ref,
             "newly_ready_tasks": unblocked,
+            "_agent_id": lease.agent_id,
         }
 
     def _auto_ready_dependents(self) -> list[str]:
@@ -1197,6 +1280,11 @@ class TelosService:
                         }
                     )
 
+        def last_failure(task_id: str) -> str:
+            last = self.get_attempts_for_task(task_id)[-1:]
+            return f"{last[0].category.value}: {last[0].rationale[:160]}" if last else ""
+
+        work = [n for n in dag.nodes.values() if not n.kind.is_right_wing]
         return {
             "active_leases": [
                 {
@@ -1205,6 +1293,7 @@ class TelosService:
                     "lease_id": n.active_lease_id,
                     "fencing_token": n.fencing_token,
                     "strikes": f"{n.strike_count}/{n.max_strikes}",
+                    "last_failure": last_failure(n.id),
                 }
                 for n in leased_by_agent
             ],
@@ -1216,15 +1305,20 @@ class TelosService:
                     "est_min": round(l.estimates.duration_minutes.mean, 1),
                     "float_min": cpm_map[l.id].total_float if l.id in cpm_map else 0.0,
                     "critical": cpm_map[l.id].is_critical if l.id in cpm_map else False,
+                    "contract": self._has_locked_contract(dag, l.id),
                 }
                 for l in leaves[:5]
             ],
+            "blocked_tasks": self.blocked_tasks(dag),
+            "done_tasks": [n.title for n in work if n.state == KanbanState.DONE],
             "quarantined_tasks": quarantined,
             "integrity_violations": {n.id: n._integrity_error for n in dag.nodes.values() if n._integrity_error},
             "sub_projects": sub_summaries,
             "counts": {
                 "done": sum(1 for n in dag.nodes.values() if n.state == KanbanState.DONE),
                 "total": len(dag.nodes),
+                "tasks_done": sum(1 for n in work if n.state == KanbanState.DONE),
+                "tasks_total": len(work),
             },
         }
 
@@ -1414,23 +1508,15 @@ TELOS_BLOCK_BEGIN = "<!-- telos:begin -->"
 TELOS_BLOCK_END = "<!-- telos:end -->"
 
 AGENT_PROTOCOL_BLOCK = f"""{TELOS_BLOCK_BEGIN}
-## Telos workspace: how work is done here
+## Telos: how work is done here
 
-This repository is managed by Telos (`.telos/`). A task is done only when Telos verifies it; you cannot mark it done yourself. Use the `telos_*` MCP tools if your harness has them, otherwise the `telos` CLI (same rules; `--format toon` keeps output short):
+Tasks here close only when Telos verifies them; you cannot mark one done. Use the `telos_*` MCP tools, or else the CLI `telos --format toon <cmd> --agent <you>`.
 
-| Step | MCP tool | CLI |
-|---|---|---|
-| Orient | `telos_pulse` | `telos --format toon pulse --agent <you>` |
-| Lease a ready task | `telos_checkout_leaf` | `telos --format toon checkout <task_id> --agent <you>` |
-| Missing prerequisite | `telos_mikado_discover` | `telos --format toon mikado <task_id> --lease-id <L> --token <N> --prereq-title "..." --why "..."` |
-| Report tokens used | `telos_heartbeat` | `telos heartbeat <task_id> --lease-id <L> --token <N> --tokens-used <n>` |
-| Close the task | `telos_submit_verification` | `telos --format toon verify <task_id> --lease-id <L> --token <N>` |
-
-1. Start with pulse. Work only on a task you leased, and keep its `lease_id` and `fencing_token`.
-2. Read `episodic_memory_do_not_repeat` in the checkout result; never repeat a failed approach.
-3. Change the code under test only. Locked tests, `conftest.py`, pytest configuration and everything under `.telos/` are sealed: touching them quarantines the task.
-4. A task without a locked contract cannot be leased. Locking contracts, releasing quarantine, `attest-done` and `reseal` are human-only. Say what you need and stop; never work around a gate.
-5. Report what Telos returned (passed or failed, state, receipt id), not your own opinion of the code.
+1. `telos_checkout_leaf` with no task_id leases the top ready task (or resumes yours) and returns its spec, locked tests, `lease_id`, `fencing_token` and failed attempts. Never repeat a failed attempt. CLI: `checkout`.
+2. Change only the code under test. Locked tests, `conftest.py`, pytest config and `.telos/` are sealed: touching them quarantines the task. Get state from Telos, not by reading `.telos/`.
+3. `telos_submit_verification` (task_id, lease_id, fencing_token, `next: true`) runs the locked tests and on a pass leases the next task in the same call. CLI: `verify <id> --lease-id L --token N --next`.
+4. Missing prerequisite: `telos_mikado_discover`. If a task cannot pass without touching sealed files, say why and stop. Locking contracts, quarantine release, `attest-done` and `reseal` are human-only; never work around a gate.
+5. `telos_pulse` shows leases, ready, blocked (with reasons) and done. Report what Telos returned (passed/failed, state, receipt id).
 {TELOS_BLOCK_END}
 """
 

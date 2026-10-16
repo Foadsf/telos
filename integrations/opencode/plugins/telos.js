@@ -69,13 +69,15 @@ function pulse(root) {
 
 function summarize(p) {
   if (!p) return { variant: "warning", message: "Telos state unreadable; run `telos pulse` in a terminal." };
-  const ready = (p.ready_mikado_leaves || []).length;
+  const leasable = (p.ready_mikado_leaves || []).filter((l) => l.contract !== false);
+  const ready = leasable.length;
   const leased = (p.active_leases || []).length;
   const quarantined = (p.quarantined_tasks || []).length;
   const integrity = Object.keys(p.integrity_violations || {}).length;
-  const counts = p.counts ? ` | ${p.counts.done}/${p.counts.total} done` : "";
+  const c = p.counts;
+  const counts = c ? ` | ${c.tasks_done ?? c.done}/${c.tasks_total ?? c.total} done` : "";
   let message = `${ready} ready | ${leased} leased | ${quarantined} quarantined${counts}`;
-  const top = (p.ready_mikado_leaves || [])[0];
+  const top = leasable[0];
   if (top) message += `\nnext: ${top.title}`;
   if (integrity) {
     return { variant: "error", message: `${integrity} integrity violation(s): state edited outside Telos. ${message}` };

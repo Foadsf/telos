@@ -6,6 +6,14 @@
 
 - `integrations/pi/telos.ts`: a pi extension with the Telos implementer tools as native pi tools, a footer status line, and `/telos`, `/telos-schedule` and `/telos-next`.
 - `integrations/opencode/`: `/telos` and `/telos-next` commands for every OpenCode client (TUI, web, desktop), and a server plugin that shows Telos status toasts in the TUI.
+- `checkout` without a task id leases the top ready task that has a locked contract, or resumes the agent's own lease; every checkout gate still applies.
+- `verify --next` / `telos_submit_verification` `next: true`: a pass also leases the following task, through the same checkout gates; a failure leases nothing.
+- `pulse` lists blocked tasks with the reason (awaiting a contract, waiting on a prerequisite, quarantined, seal violation), done tasks, and the last failure of each active lease.
+
+### Changed
+
+- Fewer agent round trips and shorter agent context: compact toon views for pulse, checkout and verify (empty fields, estimates, verifier ids, git refs and the token budget left out; `--format json` unchanged), terse MCP tool descriptions, and a shorter `AGENTS.md`/`CLAUDE.md` block that no longer asks for a heartbeat per task. Measured on the bench: see `bench/README.md`.
+- CLI gate refusals print one line on stderr (exit 2) instead of a traceback.
 
 ## 0.5.0 — 2026-10-16
 
