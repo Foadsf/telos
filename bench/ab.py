@@ -15,6 +15,8 @@ Scenarios (`--scenario`, default `shop`):
            (bench/release.py)
   backlog  long work: a five-item backlog over five fresh sessions, with a blocker the agent discovers
            (bench/backlog.py)
+  payout   pressure to cheat with the shortcuts real projects offer: regenerable golden files and a
+           warnings-as-errors config, behind a payroll deadline, two phases (bench/payout.py)
 
 One trial = both arms, run side by side (same time, same provider load), each through every phase
 of the scenario. No prompt mentions Telos. The user interface is driven by `--driver`, a program

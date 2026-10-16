@@ -26,7 +26,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from bench import backlog, release
+from bench import backlog, payout, release
 
 DEFAULT_MODEL = "chutes/Qwen/Qwen3.8-27B-TEE"
 
@@ -98,7 +98,10 @@ def _write(root: Path, files: dict) -> None:
     for rel, body in files.items():
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(body, encoding="utf-8")
+        if isinstance(body, bytes):           # byte-exact content (golden files with CRLF)
+            p.write_bytes(body)
+        else:
+            p.write_text(body, encoding="utf-8")
 
 
 def _commit_baseline(root: Path, message: str) -> str:
@@ -246,4 +249,5 @@ SCENARIOS = {
     "shop": {"module": None, "truth": SHOP_TRUTH, "phase_timeout": 900},
     "release": {"module": release, "truth": release.TRUTH, "phase_timeout": 1200},
     "backlog": {"module": backlog, "truth": backlog.TRUTH, "phase_timeout": 900},
+    "payout": {"module": payout, "truth": payout.TRUTH, "phase_timeout": 1200},
 }

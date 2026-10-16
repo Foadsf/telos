@@ -49,7 +49,10 @@ CONFLICT = re.compile(r"(?i)(conflict|contradict|incompatible|mutually exclusive
 
 
 def _git(repo: Path, *a: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *a], cwd=repo, capture_output=True, text=True, check=False)
+    # UTF-8, not the locale code page: a diff with a non-ASCII name crashed the reader thread
+    # under cp1252 and left stdout None.
+    return subprocess.run(["git", *a], cwd=repo, capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", check=False)
 
 
 CHECK_TIMEOUT_S = 30          # a check still running after this is red (the slow baseline, an endless loop)
@@ -84,9 +87,9 @@ def original_tests(repo: Path, baseline: str, truth: dict) -> dict:
     With `holdout` in the truth, also {"holdout:<check>": passed} for tests the agent never saw;
     `baseline_files` (data the tests read) are taken from the baseline, never from the agent's copy;
     checks in `seeded` must pass under every PYTHONHASHSEED in `seeds`."""
-    # Next to the repository, not in the shared %TEMP%: other test suites on this machine sweep
-    # telos-prefixed temp directories, and a swept scratch copy reads as a red check.
-    tmp = Path(tempfile.mkdtemp(prefix=".bench_truth_", dir=Path(repo).resolve().parent))
+    # In the (short) system temp directory: under a deep run directory the copied paths can pass
+    # Windows' 260-character limit, and a file Python cannot open reads as a red check.
+    tmp = Path(tempfile.mkdtemp(prefix="telos_bench_truth_"))
     try:
         for d in truth["src_dirs"]:
             if (repo / d).exists():
@@ -95,12 +98,13 @@ def original_tests(repo: Path, baseline: str, truth: dict) -> dict:
         for n in names + list(truth.get("baseline_files", [])):
             # cat-file, not show: `git show REV:PATH` first stats REV:PATH as a file and dies with
             # "Filename too long" under a deep directory, which left the scratch tests EMPTY (red).
-            g = _git(repo, "cat-file", "-p", f"{baseline}:{n}")
+            g = subprocess.run(["git", "cat-file", "-p", f"{baseline}:{n}"], cwd=repo, capture_output=True,
+                               check=False)
             if g.returncode:          # a failed read is a broken instrument, never a red check
-                raise RuntimeError(f"cannot read {n} at the baseline: {g.stderr.strip()}")
-            body = g.stdout
+                raise RuntimeError(f"cannot read {n} at the baseline: {g.stderr.decode(errors='replace').strip()}")
+            body = g.stdout           # bytes: golden files must stay byte-exact
             (tmp / n).parent.mkdir(parents=True, exist_ok=True)
-            (tmp / n).write_text(body, encoding="utf-8")
+            (tmp / n).write_bytes(body)
         for rel, body in truth.get("holdout_files", {}).items():
             (tmp / rel).parent.mkdir(parents=True, exist_ok=True)
             (tmp / rel).write_text(body, encoding="utf-8")
@@ -285,7 +289,7 @@ def rejudge(judge: dict, msgs: list | None, truth: dict) -> dict:
 
 def verdict_for(truth: dict, t: dict, c: dict, m: dict, calls: list) -> dict:
     """The scenario's own verdict; `shop` keeps the original phase_verdict."""
-    kind = truth.get("scenario")
+    kind = truth.get("verdict", truth.get("scenario"))
     if kind == "release":
         return release_verdict(t, c, m, calls, truth)
     if kind == "backlog":
