@@ -170,8 +170,8 @@ def test_zwicky_commit_spawns_traced_vmodel_nodes_and_bootstrap(tmp_path: Path) 
 
     # Test agent bootstrap file generation
     boot = svc.bootstrap_agent_configs()
-    assert Path(boot["mcp_config"]).exists()
-    assert Path(boot["agents_md"]).exists()
+    assert Path(boot["written"][".mcp.json"]).exists()
+    assert Path(boot["written"]["AGENTS.md"]).exists()
 
     # Test JSON-RPC dispatcher protocol message handling (used by stdio & Streamable HTTP)
     dispatcher = TelosMcpDispatcher(tmp_path)

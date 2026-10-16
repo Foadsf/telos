@@ -389,6 +389,27 @@ def test_git_plumbing_never_touches_paths_telos_does_not_own(tmp_path: Path) -> 
     assert git("for-each-ref", "refs/telos") == ""
 
 
+# ----------------------------------------------------------------------------- agent bootstrap
+def test_bootstrap_merges_and_never_clobbers(tmp_path: Path) -> None:
+    svc = _workspace(tmp_path)
+    (tmp_path / "AGENTS.md").write_text("# Project rules\n\nKeep this line.\n", encoding="utf-8")
+    (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": {"other": {"command": "x"}}}), encoding="utf-8")
+    (tmp_path / "opencode.json").write_text(json.dumps({"model": "chutes/x", "mcp": {"keep": {"type": "local"}}}), encoding="utf-8")
+
+    svc.bootstrap_agent_configs()
+    svc.bootstrap_agent_configs()  # idempotent
+
+    agents = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
+    assert "Keep this line." in agents and agents.count("<!-- telos:begin -->") == 1
+    mcp = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert set(mcp["mcpServers"]) == {"other", "telos"}
+    assert "--role" not in mcp["mcpServers"]["telos"]["args"]
+    oc = json.loads((tmp_path / "opencode.json").read_text(encoding="utf-8"))
+    assert oc["model"] == "chutes/x" and set(oc["mcp"]) == {"keep", "telos"}
+    assert "architect" not in json.dumps(oc)
+    assert "<!-- telos:begin -->" in (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")
+
+
 # ----------------------------------------------------------------------------- idempotency
 def test_zwicky_commit_is_idempotent(tmp_path: Path) -> None:
     svc = _workspace(tmp_path)

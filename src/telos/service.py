@@ -1360,47 +1360,92 @@ class TelosService:
             "spawned_node_ids": spawned_ids,
         }
 
-    def bootstrap_agent_configs(self) -> dict[str, str]:
-        """Generate .mcp.json and AGENTS.md / CLAUDE.md instructions for AI assistants."""
-        mcp_json_path = self.root / ".mcp.json"
-        # Implementer surface only. An architect agent gets its own server entry with `--role architect`,
-        # configured by a human in that agent's harness, never alongside the implementer's.
-        mcp_cmd = shutil.which("telos-mcp")
+    def bootstrap_agent_configs(self) -> dict[str, Any]:
+        """
+        Register the implementer MCP server for Claude Code (`.mcp.json`) and OpenCode (`opencode.json`),
+        and write the agent protocol into AGENTS.md / CLAUDE.md as a marked block. Existing files are
+        merged, never overwritten: other MCP servers and the project's own instructions survive.
+        The architect role is never registered here; a human gives it to a separate agent.
+        """
+        mcp_cmd = "telos-mcp" if shutil.which("telos-mcp") else None
         if mcp_cmd is None:
             sibling = Path(sys.executable).with_name("telos-mcp.exe" if os.name == "nt" else "telos-mcp")
             mcp_cmd = str(sibling) if sibling.exists() else "telos-mcp"
-        mcp_config = {
-            "mcpServers": {
-                "telos": {
-                    "command": mcp_cmd,
-                    "args": [],
-                }
-            }
-        }
-        mcp_json_path.write_text(json.dumps(mcp_config, indent=2) + "\n", encoding="utf-8")
+        root_arg = ["--root", str(self.root)]
 
-        agent_rules = """# Telos Cognitive Exoskeleton Protocol (Mandatory for AI Agents)
+        written: dict[str, str] = {}
+        skipped: dict[str, str] = {}
 
-You are operating inside a **Telos** deterministic systems-engineering workspace (`.telos/`).
-To prevent context drift, local-optima loops, and reward hacking, follow this strict execution loop:
+        def merge_json(path: Path, mutate: Any, fresh: dict[str, Any]) -> None:
+            if path.exists():
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as exc:
+                    skipped[path.name] = f"not plain JSON ({exc.msg}); add the telos entry by hand"
+                    return
+            else:
+                data = dict(fresh)
+            mutate(data)
+            path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            written[path.name] = str(path)
 
-1. **Orient (`telos_pulse` / `telos_waves`):** At the start of every session, call `telos_pulse` to inspect active leases, critical path tasks (`float_min=0`), and unblocked Mikado leaf tasks.
-2. **Design Complex Features (`telos_zwicky_create` / `telos_zwicky_solve` / `telos_zwicky_commit`):** Before decomposing ambiguous architectural features, evaluate dimensions and incompatibilities in a Zwicky Morphological Box.
-3. **Contracts come from the architect, not you:** A task can only be leased once an architect (a human via `telos contract-lock`, or an agent running `telos-mcp --role architect`) has locked a test that FAILS on the current tree. If a task has no contract, say so and stop; do not write your own exam.
-4. **Lease Unblocked Leaves Only (`telos_checkout_leaf`):** Never edit code without an active `lease_id` and `fencing_token`. Respect Kanban WIP limits. Read `episodic_memory_do_not_repeat` in the checkout capsule so you never repeat a failed approach.
-5. **Pivot Immediately on Blockers (`telos_mikado_discover`):** If you hit an unmet prerequisite or failing upstream assumption, DO NOT brute-force edits across unrelated files. Call `telos_mikado_discover` to snapshot/reset the worktree and record the prerequisite; it waits for an architect's contract.
-6. **Report Heartbeats (`telos_heartbeat`):** Report token usage during multi-step work.
-7. **Zero-Trust Verification (`telos_submit_verification`):** Close tasks solely via `telos_submit_verification`. Locked tests, conftest.py, pytest configuration and the `.telos/` files are sealed: changing them quarantines the task. Quarantine is released only by a human.
+        merge_json(
+            self.root / ".mcp.json",
+            lambda d: d.setdefault("mcpServers", {}).__setitem__(
+                "telos", {"command": mcp_cmd, "args": root_arg}
+            ),
+            {},
+        )
+        merge_json(
+            self.root / "opencode.json",
+            lambda d: d.setdefault("mcp", {}).__setitem__(
+                "telos", {"type": "local", "command": [mcp_cmd, *root_arg], "enabled": True}
+            ),
+            {"$schema": "https://opencode.ai/config.json"},
+        )
+        for name in ("AGENTS.md", "CLAUDE.md"):
+            path = self.root / name
+            _upsert_marked_block(path, AGENT_PROTOCOL_BLOCK)
+            written[name] = str(path)
+        return {"written": written, "skipped": skipped}
+
+
+TELOS_BLOCK_BEGIN = "<!-- telos:begin -->"
+TELOS_BLOCK_END = "<!-- telos:end -->"
+
+AGENT_PROTOCOL_BLOCK = f"""{TELOS_BLOCK_BEGIN}
+## Telos workspace: how work is done here
+
+This repository is managed by Telos (`.telos/`). A task is done only when Telos verifies it; you cannot mark it done yourself. Use the `telos_*` MCP tools if your harness has them, otherwise the `telos` CLI (same rules; `--format toon` keeps output short):
+
+| Step | MCP tool | CLI |
+|---|---|---|
+| Orient | `telos_pulse` | `telos --format toon pulse --agent <you>` |
+| Lease a ready task | `telos_checkout_leaf` | `telos --format toon checkout <task_id> --agent <you>` |
+| Missing prerequisite | `telos_mikado_discover` | `telos --format toon mikado <task_id> --lease-id <L> --token <N> --prereq-title "..." --why "..."` |
+| Report tokens used | `telos_heartbeat` | `telos heartbeat <task_id> --lease-id <L> --token <N> --tokens-used <n>` |
+| Close the task | `telos_submit_verification` | `telos --format toon verify <task_id> --lease-id <L> --token <N>` |
+
+1. Start with pulse. Work only on a task you leased, and keep its `lease_id` and `fencing_token`.
+2. Read `episodic_memory_do_not_repeat` in the checkout result; never repeat a failed approach.
+3. Change the code under test only. Locked tests, `conftest.py`, pytest configuration and everything under `.telos/` are sealed: touching them quarantines the task.
+4. A task without a locked contract cannot be leased. Locking contracts, releasing quarantine, `attest-done` and `reseal` are human-only. Say what you need and stop; never work around a gate.
+5. Report what Telos returned (passed or failed, state, receipt id), not your own opinion of the code.
+{TELOS_BLOCK_END}
 """
-        agents_md_path = self.root / "AGENTS.md"
-        claude_md_path = self.root / "CLAUDE.md"
-        agents_md_path.write_text(agent_rules, encoding="utf-8")
-        if not claude_md_path.exists():
-            claude_md_path.write_text(agent_rules, encoding="utf-8")
 
-        return {
-            "mcp_config": str(mcp_json_path),
-            "agents_md": str(agents_md_path),
-            "claude_md": str(claude_md_path),
-        }
+
+def _upsert_marked_block(path: Path, block: str) -> None:
+    """Insert or replace the Telos block in an instructions file, leaving everything else untouched."""
+    if not path.exists():
+        path.write_text(block, encoding="utf-8")
+        return
+    text = path.read_text(encoding="utf-8")
+    start = text.find(TELOS_BLOCK_BEGIN)
+    end = text.find(TELOS_BLOCK_END)
+    if start != -1 and end > start:
+        new_text = text[:start] + block.rstrip("\n") + text[end + len(TELOS_BLOCK_END):]
+    else:
+        new_text = text.rstrip("\n") + "\n\n" + block
+    path.write_text(new_text, encoding="utf-8")
 
