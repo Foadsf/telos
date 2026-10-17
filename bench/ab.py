@@ -65,6 +65,27 @@ def assert_neutral(prompts=None) -> None:
             raise ValueError(f"a bench prompt mentions Telos: {p!r}")
 
 
+HUNG = 124                    # our exit code for a driver killed after overrunning its own deadline
+
+
+def _run_driver(argv: list, limit_s: float) -> subprocess.CompletedProcess:
+    """Run the driver; past `limit_s` kill its whole process tree. subprocess.run(timeout=) kills
+    only the driver itself, which left its OpenCode server and browser running (and working on the
+    repository) after a hang on 2026-10-16."""
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                         errors="replace")
+    try:
+        out, err = p.communicate(timeout=limit_s)
+        return subprocess.CompletedProcess(argv, p.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True, check=False)
+        else:
+            p.kill()
+        out, err = p.communicate()
+        return subprocess.CompletedProcess(argv, HUNG, out or "", (err or "") + f"\ndriver hung past {limit_s}s; killed")
+
+
 def run_phase(a, arm: str, phase: int, repo: Path, out: Path, port: int, trial: str) -> dict:
     tag = f"{arm}-p{phase}"
     pf = out / f"prompt-{tag}.txt"
@@ -75,8 +96,7 @@ def run_phase(a, arm: str, phase: int, repo: Path, out: Path, port: int, trial: 
             "--title", f"{trial} {arm} phase {phase}", "--timeout", str(a.phase_timeout),
             "--model-label", a.model_label, "--expect-model", a.model]
     t0 = time.monotonic()
-    r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                       timeout=a.phase_timeout + 600, check=False)
+    r = _run_driver(argv, a.phase_timeout + 600)
     try:
         res = json.loads(r.stdout)
     except json.JSONDecodeError:
@@ -84,6 +104,7 @@ def run_phase(a, arm: str, phase: int, repo: Path, out: Path, port: int, trial: 
                "raw": (r.stdout + r.stderr)[-1500:]}
     run = res.get("data") or {}
     # exit 0 = finished; 5 = the agent was still working at the deadline, which is behaviour, not failure.
+    # A hung driver (killed here) is neither: the phase is invalid, and the next session still runs.
     valid = r.returncode in (0, 5) and mf.exists()
     rec = {"exit": r.returncode, "detail": res.get("detail"), "valid": valid, "run": run,
            "driver_wall_s": round(time.monotonic() - t0, 1)}

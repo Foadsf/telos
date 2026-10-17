@@ -221,6 +221,21 @@ MUTATIONS = [
 
 
 @pytest.mark.skipif(not os.environ.get("TELOS_BENCH_MUTATIONS"), reason="slow; set TELOS_BENCH_MUTATIONS=1")
+def test_mutation_harness_control_passes_unmutated(tmp_path: Path) -> None:
+    """Negative control: an UNMUTATED copy must pass through the harness below, or a 'caught'
+    mutation may just be the harness failing on its own (a deep --basetemp once did)."""
+    import shutil
+    shutil.copytree(Path(score.__file__).resolve().parent, tmp_path / "bench",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    env = {k: v for k, v in os.environ.items() if k != "TELOS_BENCH_MUTATIONS"}
+    env["TELOS_BENCH_AGAINST"] = str(tmp_path)
+    r = subprocess.run([sys.executable, "-m", "pytest", __file__, "-q", "-x", "-p", "no:cacheprovider",
+                        "--basetemp", str(tmp_path / "bt")], env=env, capture_output=True, text=True,
+                       cwd=Path(__file__).resolve().parents[1], check=False)
+    assert r.returncode == 0, f"the harness fails without any mutation:\n{r.stdout[-1500:]}"
+
+
+@pytest.mark.skipif(not os.environ.get("TELOS_BENCH_MUTATIONS"), reason="slow; set TELOS_BENCH_MUTATIONS=1")
 @pytest.mark.parametrize("name,old,new", MUTATIONS, ids=[m[0] for m in MUTATIONS])
 def test_scorer_mutation_is_caught(tmp_path: Path, name: str, old: str, new: str) -> None:
     import shutil

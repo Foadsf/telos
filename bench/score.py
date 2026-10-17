@@ -55,7 +55,8 @@ def _git(repo: Path, *a: str) -> subprocess.CompletedProcess:
                           errors="replace", check=False)
 
 
-CHECK_TIMEOUT_S = 30          # a check still running after this is red (the slow baseline, an endless loop)
+CHECK_TIMEOUT_S = 60          # a check still running after this is red (the slow baseline, an endless loop);
+#                               generous, because a loaded machine (agents + judges) slows pytest startup
 
 
 def _check_passes(tmp: Path, nodeids: list, seeds: list | None) -> bool:

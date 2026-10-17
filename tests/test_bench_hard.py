@@ -81,6 +81,25 @@ def test_hard_prompts_never_mention_telos_and_are_registered() -> None:
         assert "telos" not in p.lower()
 
 
+def test_a_hung_driver_is_killed_with_its_children(tmp_path: Path) -> None:
+    """A driver past its limit is killed with its whole tree; its grandchild (the OpenCode server in
+    real runs) must not outlive it, or communicate() would wait on its inherited pipes."""
+    import time
+    pidfile = tmp_path / "grandchild.pid"
+    code = ("import subprocess, sys, time\n"
+            "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+            f"open(r'{pidfile}', 'w').write(str(c.pid))\n"
+            "time.sleep(120)\n")
+    t0 = time.monotonic()
+    r = ab._run_driver([sys.executable, "-c", code], 3)
+    assert r.returncode == ab.HUNG and "hung" in r.stderr
+    assert time.monotonic() - t0 < 60
+    gc = int(pidfile.read_text())
+    alive = subprocess.run(["tasklist", "/FI", f"PID eq {gc}"], capture_output=True, text=True).stdout \
+        if sys.platform == "win32" else ""
+    assert str(gc) not in alive, "the grandchild outlived the kill"
+
+
 # ------------------------------------------------------------------ release: ground truth
 
 def test_release_baseline_is_red_everywhere(tmp_path: Path, monkeypatch) -> None:
@@ -472,19 +491,34 @@ MUTATIONS = [
 ]
 
 
-@pytest.mark.skipif(not os.environ.get("TELOS_BENCH_MUTATIONS"), reason="slow; set TELOS_BENCH_MUTATIONS=1")
-@pytest.mark.parametrize("name,old,new", MUTATIONS, ids=[m[0] for m in MUTATIONS])
-def test_hard_scorer_mutation_is_caught(tmp_path: Path, name: str, old: str, new: str) -> None:
+def _suite_against(tmp_path: Path, old: str | None = None, new: str = "") -> subprocess.CompletedProcess:
+    """Run this file against a copy of `bench`, optionally with one scorer edit."""
     import shutil
     src = Path(score.__file__).resolve().parent
     shutil.copytree(src, tmp_path / "bench", ignore=shutil.ignore_patterns("__pycache__"))
-    f = tmp_path / "bench" / "score.py"
-    body = f.read_text(encoding="utf-8")
-    assert body.count(old) == 1, f"stale mutation anchor: {name}"
-    f.write_text(body.replace(old, new), encoding="utf-8")
+    if old is not None:
+        f = tmp_path / "bench" / "score.py"
+        body = f.read_text(encoding="utf-8")
+        assert body.count(old) == 1, f"stale mutation anchor: {old[:60]!r}"
+        f.write_text(body.replace(old, new), encoding="utf-8")
     env = {k: v for k, v in os.environ.items() if k != "TELOS_BENCH_MUTATIONS"}
     env["TELOS_BENCH_AGAINST"] = str(tmp_path)
-    r = subprocess.run([sys.executable, "-m", "pytest", __file__, "-q", "-x", "-p", "no:cacheprovider",
-                        "--basetemp", str(tmp_path / "bt")], env=env, capture_output=True, text=True,
-                       cwd=Path(__file__).resolve().parents[1], check=False)
+    return subprocess.run([sys.executable, "-m", "pytest", __file__, "-q", "-x", "-p", "no:cacheprovider",
+                           "--basetemp", str(tmp_path / "bt")], env=env, capture_output=True, text=True,
+                          cwd=Path(__file__).resolve().parents[1], check=False)
+
+
+@pytest.mark.skipif(not os.environ.get("TELOS_BENCH_MUTATIONS"), reason="slow; set TELOS_BENCH_MUTATIONS=1")
+def test_mutation_harness_control_passes_unmutated(tmp_path: Path) -> None:
+    """Negative control: an UNMUTATED copy must pass through the same harness, or every 'caught'
+    below may be the harness failing (a deep --basetemp once broke every inner run on its own)."""
+    r = _suite_against(tmp_path)
+    assert r.returncode == 0, f"the harness fails without any mutation:\n{r.stdout[-1500:]}"
+
+
+@pytest.mark.skipif(not os.environ.get("TELOS_BENCH_MUTATIONS"), reason="slow; set TELOS_BENCH_MUTATIONS=1")
+@pytest.mark.parametrize("name,old,new", MUTATIONS, ids=[m[0] for m in MUTATIONS])
+def test_hard_scorer_mutation_is_caught(tmp_path: Path, name: str, old: str, new: str) -> None:
+    r = _suite_against(tmp_path, old, new)
     assert r.returncode != 0, f"mutation SURVIVED: {name}\n{r.stdout[-800:]}"
+    assert " passed" in r.stdout or " failed" in r.stdout, f"the inner run never ran a test: {r.stdout[-800:]}"
