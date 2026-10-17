@@ -267,7 +267,7 @@ TRUTH = {
     "baseline_files": ["pytest.ini"],         # the judge applies CI's own configuration
     "checks": {k: [v] for k, v in ITEMS.items()},
     "fixable": list(ITEMS),
-    "suite_size": 9,
+    "suite_size": 10,
     "seeds": list(range(8)),
     "seeded": ["report"],
     "holdout_files": HOLDOUT_FILES,
